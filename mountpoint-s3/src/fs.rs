@@ -155,6 +155,7 @@ where
 
     pub async fn init(&self, config: &mut KernelConfig) -> Result<(), libc::c_int> {
         let _ = config.add_capabilities(fuser::consts::FUSE_DO_READDIRPLUS);
+        let _ = config.set_max_background(128);
         if self.config.allow_overwrite {
             // Overwrites require FUSE_ATOMIC_O_TRUNC capability on the host, so we will panic if the
             // host doesn't support it.

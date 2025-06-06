@@ -160,31 +160,56 @@ impl<FS: Filesystem> Session<FS> {
             buffer.deref_mut(),
             std::mem::align_of::<abi::fuse_in_header>(),
         );
+        
+        // Use a mutex to ensure only one thread reads from the channel at a time
+        // This eliminates contention when multiple threads call run_with_callbacks
+        use std::sync::Mutex;
+        static CHANNEL_MUTEX: Mutex<()> = Mutex::new(());
+        
         loop {
+            // Acquire lock before reading from the channel
+            let _lock = CHANNEL_MUTEX.lock().unwrap();
+            
             // Read the next request from the given channel to kernel driver
             // The kernel driver makes sure that we get exactly one request per read
-            match self.ch.receive(buf) {
-                Ok(size) => match Request::new(self.ch.sender(), &buf[..size]) {
-                    // Dispatch request
-                    Some(req) => {
-                        before_dispatch(&req);
-                        req.dispatch(self);
-                        after_dispatch(&req);
-                    },
-                    // Quit loop on illegal request
-                    None => break,
+            let result = self.ch.receive(buf);
+            
+            // Process the result after releasing the lock
+            match result {
+                Ok(size) => {
+                    // Create the request object while still holding the lock
+                    let req_opt = Request::new(self.ch.sender(), &buf[..size]);
+                    
+                    // Release the lock before dispatching
+                    drop(_lock);
+                    
+                    match req_opt {
+                        // Dispatch request
+                        Some(req) => {
+                            before_dispatch(&req);
+                            req.dispatch(self);
+                            after_dispatch(&req);
+                        },
+                        // Quit loop on illegal request
+                        None => break,
+                    }
                 },
-                Err(err) => match err.raw_os_error() {
-                    // Operation interrupted. Accordingly to FUSE, this is safe to retry
-                    Some(ENOENT) => continue,
-                    // Interrupted system call, retry
-                    Some(EINTR) => continue,
-                    // Explicitly try again
-                    Some(EAGAIN) => continue,
-                    // Filesystem was unmounted, quit the loop
-                    Some(ENODEV) => break,
-                    // Unhandled error
-                    _ => return Err(err),
+                Err(err) => {
+                    // Release the lock before handling errors
+                    drop(_lock);
+                    
+                    match err.raw_os_error() {
+                        // Operation interrupted. Accordingly to FUSE, this is safe to retry
+                        Some(ENOENT) => continue,
+                        // Interrupted system call, retry
+                        Some(EINTR) => continue,
+                        // Explicitly try again
+                        Some(EAGAIN) => continue,
+                        // Filesystem was unmounted, quit the loop
+                        Some(ENODEV) => break,
+                        // Unhandled error
+                        _ => return Err(err),
+                    }
                 },
             }
         }

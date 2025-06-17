@@ -126,6 +126,11 @@ def _mount_mp(
     if cfg['mountpoint_congestion_threshold'] is not None:
         subprocess_env["UNSTABLE_MOUNTPOINT_CONGESTION_THRESHOLD"] = str(cfg["mountpoint_congestion_threshold"])
 
+    if cfg['mountpoint_clone_fuse_fd'] is not None:
+        subprocess_env["MOUNTPOINT_CLONE_FUSE_FD"] = str(cfg["mountpoint_clone_fuse_fd"]).lower()
+
+    subprocess_env['MOUNTPOINT_LOG'] = 'fuser=info'
+
     stub_mode = str(cfg["stub_mode"]).lower()
     if stub_mode != "off" and cfg["mountpoint_binary"] is not None:
         raise ValueError("Cannot use `stub_mode` with `mountpoint_binary`, `stub_mode` requires recompilation")

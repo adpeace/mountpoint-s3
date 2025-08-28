@@ -43,13 +43,14 @@ impl FuseSession {
                 session_acl_from_mount_options(&fuse_session_config.options),
             ),
         };
-        Self::from_session(session, fuse_session_config.max_threads).context("Failed to start FUSE session")
+        Self::from_session(session, fuse_session_config.max_threads, fuse_session_config.clone_fuse_fd).context("Failed to start FUSE session")
     }
 
     /// Create worker threads to dispatch requests for a FUSE session.
     fn from_session<FS: Filesystem + Send + Sync + 'static>(
         mut session: Session<FS>,
         max_worker_threads: usize,
+        clone_fuse_fd: bool,
     ) -> anyhow::Result<Self> {
         assert!(max_worker_threads > 0);
 
@@ -100,7 +101,7 @@ impl FuseSession {
                 .context("failed to spawn waiter thread")?
         };
 
-        WorkerPool::start(session, workers_tx, max_worker_threads).context("failed to start worker thread pool")?;
+        WorkerPool::start(session, workers_tx, max_worker_threads, clone_fuse_fd).context("failed to start worker thread pool")?;
 
         Ok(Self {
             unmounter,
@@ -163,7 +164,7 @@ trait Work: Send + Sync + 'static {
 
     /// Run the process loop for a worker, notifying the caller
     /// before and after each unit of work is processed.
-    fn run<FB, FA>(&self, before: FB, after: FA) -> Self::Result
+    fn run<FB, FA>(&self, before: FB, after: FA, clone_fuse_fd: bool) -> Self::Result
     where
         FB: FnMut(),
         FA: FnMut();
@@ -176,6 +177,7 @@ struct WorkerPool<W: Work> {
     state: Arc<WorkerPoolState<W>>,
     workers: Sender<JoinHandle<W::Result>>,
     max_workers: usize,
+    clone_fuse_fd: bool,
 }
 
 const METRIC_NAME_PREFIX_WORKERS: &str = "fuse.mp_workers";
@@ -194,7 +196,7 @@ impl<W: Work> WorkerPool<W> {
     ///
     /// The worker pool will start with a small number of workers, and may eventually grow up to `max_workers`.
     /// The `workers` argument consumes the worker thread handles to be joined when the pool is shutting down.
-    fn start(work: W, workers: Sender<JoinHandle<W::Result>>, max_workers: usize) -> anyhow::Result<()> {
+    fn start(work: W, workers: Sender<JoinHandle<W::Result>>, max_workers: usize, clone_fuse_fd: bool) -> anyhow::Result<()> {
         assert!(max_workers > 0);
 
         tracing::trace!(max_workers, "worker pool starting");
@@ -208,6 +210,7 @@ impl<W: Work> WorkerPool<W> {
             state: state.into(),
             workers,
             max_workers,
+            clone_fuse_fd,
         };
         if !pool.try_add_worker()? {
             unreachable!("should always create at least 1 worker (max_workers > 0)");
@@ -263,6 +266,7 @@ impl<W: Work> WorkerPool<W> {
                 self.state.idle_worker_count.fetch_add(1, Ordering::SeqCst);
                 metrics::gauge!(METRIC_NAME_FUSE_WORKERS_IDLE).increment(1);
             },
+            self.clone_fuse_fd,
         )
     }
 }
@@ -273,6 +277,7 @@ impl<W: Work> Clone for WorkerPool<W> {
             state: self.state.clone(),
             workers: self.workers.clone(),
             max_workers: self.max_workers,
+            clone_fuse_fd: self.clone_fuse_fd,
         }
     }
 }
@@ -283,7 +288,7 @@ where
 {
     type Result = io::Result<()>;
 
-    fn run<FB, FA>(&self, mut before: FB, mut after: FA) -> Self::Result
+    fn run<FB, FA>(&self, mut before: FB, mut after: FA, clone_fuse_fd: bool) -> Self::Result
     where
         FB: FnMut(),
         FA: FnMut(),
@@ -303,6 +308,7 @@ where
                 }
                 after();
             },
+            clone_fuse_fd,
         )
     }
 }
@@ -366,7 +372,7 @@ mod tests {
     impl Work for TestWork {
         type Result = ();
 
-        fn run<FB, FA>(&self, mut before: FB, mut after: FA) -> Self::Result
+        fn run<FB, FA>(&self, mut before: FB, mut after: FA, _clone_fuse_fd: bool) -> Self::Result
         where
             FB: FnMut(),
             FA: FnMut(),
@@ -392,7 +398,7 @@ mod tests {
         };
 
         let (workers_tx, workers_rx) = mpsc::channel::<JoinHandle<()>>();
-        WorkerPool::start(work, workers_tx, max_worker_threads).unwrap();
+        WorkerPool::start(work, workers_tx, max_worker_threads, false).unwrap();
 
         // Send messages: when processed, they will just wait
         // until we mark them as completed.
@@ -437,7 +443,7 @@ mod tests {
     impl Work for CountWork {
         type Result = ();
 
-        fn run<FB, FA>(&self, mut before: FB, mut after: FA) -> Self::Result
+        fn run<FB, FA>(&self, mut before: FB, mut after: FA, _clone_fuse_fd: bool) -> Self::Result
         where
             FB: FnMut(),
             FA: FnMut(),
@@ -463,7 +469,7 @@ mod tests {
         };
 
         let (workers_tx, workers_rx) = mpsc::channel::<JoinHandle<()>>();
-        WorkerPool::start(work, workers_tx, max_worker_threads).unwrap();
+        WorkerPool::start(work, workers_tx, max_worker_threads, false).unwrap();
 
         // Messages will increment counter when processed.
         let counter = Arc::new(AtomicUsize::new(0));

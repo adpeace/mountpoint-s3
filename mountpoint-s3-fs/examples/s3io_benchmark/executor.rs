@@ -134,6 +134,7 @@ impl Executor {
         match config.access_pattern {
             AccessPattern::Sequential => self.execute_sequential_read(config).await,
             AccessPattern::Random => self.execute_random_read(config).await,
+            AccessPattern::MultiCursorSequential => self.execute_multi_cursor_read(config).await,
         }
     }
 
@@ -209,6 +210,128 @@ impl Executor {
             }
 
             if offset >= size {
+                iterations_completed += 1;
+            }
+        }
+
+        let duration = job_start.elapsed();
+
+        Ok(JobResult {
+            job_name: config.name.clone(),
+            workload_type: "read".to_string(),
+            iterations_completed,
+            total_bytes,
+            elapsed_seconds: duration,
+            errors,
+        })
+    }
+
+    async fn execute_multi_cursor_read(&self, config: &ResolvedJobConfig) -> Result<JobResult, ExecutionError> {
+        let client = &self.client;
+        let prefetcher = &self.prefetcher;
+        let bucket = &config.bucket;
+        let object_key = &config.object_key;
+        let handle_id = HandleId::new(self.next_handle_id.fetch_add(1, Ordering::Relaxed));
+
+        let head_result = client
+            .head_object(bucket, object_key, &HeadObjectParams::new())
+            .await
+            .map_err(|e| ExecutionError::S3Error(format!("HeadObject failed: {}", e)))?;
+
+        let object_id = ObjectId::new(object_key.to_string(), head_result.etag);
+        let size = head_result.size;
+
+        let num_cursors = config.num_cursors;
+        let bytes_per_visit = config.bytes_per_cursor_visit as u64;
+
+        if size < num_cursors as u64 {
+            return Err(ExecutionError::ExecutionFailed(format!(
+                "Object size ({}) is smaller than num_cursors ({})",
+                size, num_cursors
+            )));
+        }
+
+        let region_size = size / num_cursors as u64;
+
+        // Build cursor state: (current_offset, end_offset)
+        let mut cursors: Vec<(u64, u64)> = (0..num_cursors)
+            .map(|i| {
+                let start = i as u64 * region_size;
+                let end = if i == num_cursors - 1 { size } else { start + region_size };
+                (start, end)
+            })
+            .collect();
+
+        let mut total_bytes = 0u64;
+        let mut errors = Vec::new();
+        let mut iterations_completed = 0usize;
+
+        let job_start = Instant::now();
+        let max_duration = config.max_duration;
+
+        for _iteration in 0..config.iterations {
+            if let Some(max_dur) = max_duration
+                && job_start.elapsed() >= max_dur
+            {
+                break;
+            }
+
+            // Reset cursors for each iteration
+            for (i, cursor) in cursors.iter_mut().enumerate() {
+                cursor.0 = i as u64 * region_size;
+            }
+
+            let mut request = prefetcher.prefetch(bucket.to_string(), object_id.clone(), handle_id, size);
+            let mut iteration_bytes = 0u64;
+            let mut finished_count = 0;
+            let mut had_error = false;
+
+            'outer: loop {
+                if finished_count >= num_cursors {
+                    break;
+                }
+
+                for cursor in cursors.iter_mut() {
+                    let (ref mut offset, end) = *cursor;
+                    if *offset >= end {
+                        continue;
+                    }
+
+                    if let Some(max_dur) = max_duration
+                        && job_start.elapsed() >= max_dur
+                    {
+                        break 'outer;
+                    }
+
+                    // Read up to bytes_per_visit from this cursor
+                    let visit_end = (*offset + bytes_per_visit).min(end);
+                    while *offset < visit_end {
+                        let read_size = std::cmp::min(config.read_size as u64, visit_end - *offset);
+                        match request.read(*offset, read_size as usize).await {
+                            Ok(bytes) => {
+                                let n = bytes.len() as u64;
+                                *offset += n;
+                                iteration_bytes += n;
+                                total_bytes += n;
+                            }
+                            Err(e) => {
+                                errors.push(ErrorInfo {
+                                    error_type: "ReadError".to_string(),
+                                    message: format!("Read failed at offset {}: {}", offset, e),
+                                });
+                                had_error = true;
+                                break 'outer;
+                            }
+                        }
+                    }
+
+                    if *offset >= end {
+                        finished_count += 1;
+                    }
+                }
+            }
+
+            if !had_error && iteration_bytes == size {
                 iterations_completed += 1;
             }
         }

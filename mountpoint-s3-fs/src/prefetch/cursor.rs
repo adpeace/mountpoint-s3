@@ -1,10 +1,9 @@
-use metrics::{counter, histogram};
+use metrics::histogram;
 use mountpoint_s3_client::ObjectClient;
 use tracing::trace;
 
 use crate::checksums::ChecksummedBytes;
 use crate::memory::CursorHandle;
-use crate::metrics::defs::PREFETCH_RESET_STATE;
 use crate::object::ObjectId;
 use crate::sync::{Arc, AsyncMutex, Mutex};
 
@@ -129,17 +128,28 @@ where
         let _active_read_guard = inner.cursor_handle.set_active_read(active_start, active_size);
 
         if !inner.try_seek(self, offset).await? {
-            // Seek failed
+            // Seek failed: this cursor cannot serve the read. The caller is responsible for
+            // trying another cursor or creating a new one (and recording the reset metric).
             trace!(
                 expected = inner.current_offset,
                 actual = offset,
-                "out-of-order read, resetting prefetch"
+                "out-of-order read for this cursor"
             );
-            counter!(PREFETCH_RESET_STATE).increment(1);
             return Ok(None);
         }
 
         Ok(Some(inner.do_read(self, length).await?))
+    }
+
+    /// The current read position of the cursor (to disambiguate when selecting cursors) if it can
+    /// serve the read at `offset`, else `None`. Mirrors the seek eligibility in `try_seek` but is
+    /// non-mutating.
+    pub async fn can_serve(&self, offset: u64) -> Option<u64> {
+        let guard = self.inner.lock().await;
+        let inner = guard.as_ref()?;
+        inner
+            .can_serve(offset, self.max_forward_seek_wait_distance)
+            .then_some(inner.current_offset)
     }
 
     pub fn cursor_id(&self) -> CursorId {
@@ -193,6 +203,33 @@ where
         }
 
         Ok((response, all_parts_from_cache))
+    }
+
+    /// Whether the cursor can currently serve a read at `offset`. Mirrors the logic in
+    /// [`Self::try_seek_forward`]/[`Self::try_seek_backward`] but with no I/O and is non-mutating.
+    fn can_serve(&self, offset: u64, max_forward_seek_wait_distance: u64) -> bool {
+        if offset == self.current_offset {
+            return true;
+        }
+        if offset > self.current_offset {
+            // Forward: bounded by how far the request has actually asked S3 for data
+            // (`read_window_end_offset`) and how far past the already-downloaded offset we will
+            // block and wait (`available_offset + max_forward_seek_wait_distance`).
+            if offset >= self.request_task.read_window_end_offset() {
+                return false;
+            }
+            let available_soon_offset = self
+                .request_task
+                .available_offset()
+                .saturating_add(max_forward_seek_wait_distance);
+            offset < available_soon_offset
+        } else {
+            // Backward: bounded by the data currently held in the backward seek window.
+            self.backward_seek_window
+                .lock()
+                .unwrap()
+                .can_read_back((self.current_offset - offset) as usize)
+        }
     }
 
     /// Try to seek within the current inflight requests without restarting them.

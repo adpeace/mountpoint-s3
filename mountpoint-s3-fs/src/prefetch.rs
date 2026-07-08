@@ -42,7 +42,9 @@ use tracing::trace;
 use crate::checksums::{ChecksummedBytes, IntegrityError};
 use crate::data_cache::DataCache;
 use crate::fs::error_metadata::{ErrorMetadata, MOUNTPOINT_ERROR_CLIENT};
-use crate::metrics::defs::FUSE_CACHE_HIT;
+use crate::metrics::defs::{
+    FUSE_CACHE_HIT, PREFETCH_CURSOR_CREATED, PREFETCH_CURSOR_EVICTED, PREFETCH_CURSOR_SWITCHES, PREFETCH_RESET_STATE,
+};
 use crate::object::ObjectId;
 
 mod backpressure_controller;
@@ -69,6 +71,9 @@ use part_stream::{PartStream, RequestRange, RequestTaskConfig};
 // waiting for the readahead hurts random IO. So we add 128k to the first request size
 // to avoid the latency hit of the second request.
 pub const INITIAL_REQUEST_SIZE: usize = 1024 * 1024 + 128 * 1024;
+
+/// Default maximum number of cursors.  Set to 1 to mimic pre-multi-cursor-support behaviour.
+pub const DEFAULT_MAX_CURSORS: usize = 1;
 
 #[derive(Debug, Error)]
 pub enum PrefetchReadError<E> {
@@ -126,6 +131,8 @@ pub struct PrefetcherConfig {
     /// is made to lower the latency in small-random-reads usage pattern. If set to 0, initial request
     /// is skipped.
     pub initial_request_size: usize,
+    /// Maximum number of independent sequential read cursors tracked per file handle.
+    pub max_cursors: usize,
 }
 
 impl Default for PrefetcherConfig {
@@ -141,6 +148,7 @@ impl Default for PrefetcherConfig {
             max_forward_seek_wait_distance: 16 * 1024 * 1024,
             max_backward_seek_distance: 1 * 1024 * 1024,
             initial_request_size: INITIAL_REQUEST_SIZE,
+            max_cursors: DEFAULT_MAX_CURSORS,
         }
     }
 }
@@ -230,7 +238,11 @@ where
     bucket: String,
     object_id: ObjectId,
     size: u64,
-    cursor: Option<Cursor<Client>>,
+    /// Tracked sequential read cursors for this handle, ordered least- to
+    /// most-recently-used: the last element is the active cursor and index 0 is
+    /// the LRU (first to be dropped when the limit is exceeded). Empty until
+    /// the first read.
+    cursors: Vec<Cursor<Client>>,
     // preferred part size in the prefetcher's part queue, not the object part
     preferred_part_size: usize,
 }
@@ -253,7 +265,7 @@ where
             bucket,
             object_id,
             size,
-            cursor: None,
+            cursors: Vec::new(),
             preferred_part_size: 128 * 1024,
         }
     }
@@ -311,17 +323,71 @@ where
         let max_preferred_part_size = 1024 * 1024;
         self.preferred_part_size = self.preferred_part_size.max(length).min(max_preferred_part_size);
 
-        // Try to use the current cursor, if present. Allows for limited non sequential reads.
-        if let Some(ref mut cursor) = self.cursor
-            && let Some(result) = cursor.try_read(offset, length).await?
+        // Try the MRU cursor first to avoid a sequential read on it being captured by another
+        // cursor with an overlapping read window.
+        if let Some(active) = self.cursors.last()
+            && let Some(result) = active.try_read(offset, length).await?
         {
-            Ok(result)
-        } else {
-            // Otherwise, create a new cursor at `offset` and read from it.
-            let (cursor, result) = self.read_from_new_cursor(offset, length).await?;
-            self.cursor = Some(cursor);
-            Ok(result)
+            return Ok(result);
         }
+
+        // The active cursor couldn't serve the read: check if any other cursor can, and select the
+        // one closest to the read position. Note that the cursors might mutate between the check and
+        // the try_read attempt, so even if a cursor is selected it may become ineligible and we fall
+        // through to cursor creation anyway.
+        if let Some(index) = self.select_cursor(offset).await {
+            if let Some(result) = self.cursors[index].try_read(offset, length).await? {
+                // We switched to a non-active cursor (`select_cursor` never returns the active
+                // cursor): make it the active (most-recently-used) cursor by moving it to the end.
+                metrics::counter!(PREFETCH_CURSOR_SWITCHES).increment(1);
+                let cursor = self.cursors.remove(index);
+                self.cursors.push(cursor);
+                return Ok(result);
+            }
+        }
+
+        // No tracked cursor can serve the read: create a new one at `offset`, starting a new S3
+        // request.
+        let (cursor, result) = self.read_from_new_cursor(offset, length).await?;
+        metrics::counter!(PREFETCH_CURSOR_CREATED).increment(1);
+        self.push_cursor(cursor);
+        Ok(result)
+    }
+
+    /// Find the index of the tracked cursor best able to serve a read at `offset`, if any. Among
+    /// eligible cursors, the one whose read position is nearest to `offset` wins; ties break towards
+    /// the more-recently-used cursor (higher index). The active cursor (last) is skipped because the
+    /// caller already tried it on the fast path.
+    async fn select_cursor(&self, offset: u64) -> Option<usize> {
+        let active = self.cursors.len().checked_sub(1)?;
+        let mut best: Option<(usize, u64)> = None;
+        for index in 0..active {
+            if let Some(current_offset) = self.cursors[index].can_serve(offset).await {
+                let distance = current_offset.abs_diff(offset);
+                // `<=` so that on a tie we prefer the higher (more-recently-used) index.
+                if best.is_none_or(|(_, best_distance)| distance <= best_distance) {
+                    best = Some((index, distance));
+                }
+            }
+        }
+        best.map(|(index, _)| index)
+    }
+
+    /// Track a newly created cursor as the active (most-recently-used) cursor, dropping the least-
+    /// recently-used cursor first if we reached `max_cursors`.
+    fn push_cursor(&mut self, cursor: Cursor<Client>) {
+        debug_assert!(self.config.max_cursors >= 1, "max_cursors must be >= 1");
+        if self.cursors.len() >= self.config.max_cursors.max(1) {
+            metrics::counter!(PREFETCH_CURSOR_EVICTED).increment(1);
+            let evicted = self.cursors.remove(0);
+            trace!(
+                cursor_id = evicted.cursor_id().as_raw(),
+                key = self.object_id.key(),
+                max_cursors = self.config.max_cursors,
+                "evicted least-recently-used cursor at cap"
+            );
+        }
+        self.cursors.push(cursor);
     }
 
     /// Create a new [`Cursor`] and start reading from it.
@@ -367,9 +433,21 @@ where
         .await
     }
 
-    /// Reset this prefetch request, clearing any existing tasks queued.
+    /// Discard all prefetch state for this handle, dropping every tracked cursor (cancelling their
+    /// in-flight requests and releasing their prefetched data) so the next read starts from a clean
+    /// slate. Called after a read error. This is the hard reset the `prefetch.reset_state` metric
+    /// counts -- distinct from creating an additional cursor, which is normal multi-cursor growth
+    /// (`prefetch.cursor_created`).
     fn reset_prefetch(&mut self) {
-        self.cursor = None;
+        metrics::counter!(PREFETCH_RESET_STATE).increment(1);
+        self.cursors.clear();
+    }
+
+    /// Number of cursors currently tracked by this handle. Test-only introspection used to assert
+    /// that multi-cursor paths are actually exercised and that the `max_cursors` cap holds.
+    #[cfg(test)]
+    fn tracked_cursors(&self) -> usize {
+        self.cursors.len()
     }
 }
 
@@ -417,6 +495,8 @@ mod tests {
         max_backward_seek_distance: u64,
         #[proptest(strategy = "16usize..1*1024*1024")]
         cache_block_size: usize,
+        #[proptest(strategy = "1usize..8usize")]
+        max_cursors: usize,
     }
 
     enum PrefetcherType {
@@ -470,6 +550,7 @@ mod tests {
             max_forward_seek_wait_distance: test_config.max_forward_seek_wait_distance,
             max_backward_seek_distance: test_config.max_backward_seek_distance,
             initial_request_size: test_config.initial_request_size,
+            max_cursors: test_config.max_cursors,
         };
 
         let prefetcher = build_prefetcher(client.clone(), prefetcher_type, prefetcher_config);
@@ -501,6 +582,7 @@ mod tests {
             max_forward_seek_wait_distance: 16 * 1024 * 1024,
             max_backward_seek_distance: 2 * 1024 * 1024,
             cache_block_size: 1 * MB,
+            max_cursors: DEFAULT_MAX_CURSORS,
         };
         run_sequential_read_test(prefetcher_type, 1024 * 1024 + 111, 1024 * 1024, config);
     }
@@ -516,6 +598,7 @@ mod tests {
             max_forward_seek_wait_distance: 16 * 1024 * 1024,
             max_backward_seek_distance: 2 * 1024 * 1024,
             cache_block_size: 1 * MB,
+            max_cursors: DEFAULT_MAX_CURSORS,
         };
         run_sequential_read_test(prefetcher_type, 16 * 1024 * 1024 + 111, 1024 * 1024, config);
     }
@@ -531,6 +614,7 @@ mod tests {
             max_forward_seek_wait_distance: 16 * 1024 * 1024,
             max_backward_seek_distance: 2 * 1024 * 1024,
             cache_block_size: 1 * MB,
+            max_cursors: DEFAULT_MAX_CURSORS,
         };
 
         run_sequential_read_test(prefetcher_type, 256 * 1024 * 1024 + 111, 1024 * 1024, config);
@@ -550,6 +634,7 @@ mod tests {
             max_forward_seek_wait_distance: 16 * 1024 * 1024,
             max_backward_seek_distance: 2 * 1024 * 1024,
             cache_block_size: 1 * MB,
+            max_cursors: DEFAULT_MAX_CURSORS,
         };
 
         // read_size (4 MiB + 111) > client_part_size (1 MiB), and the odd tail crosses part
@@ -592,6 +677,7 @@ mod tests {
             max_forward_seek_wait_distance: 16 * 1024 * 1024,
             max_backward_seek_distance: 2 * 1024 * 1024,
             cache_block_size: 1 * MB,
+            max_cursors: DEFAULT_MAX_CURSORS,
         };
 
         // backpressure is not enabled for the client
@@ -614,6 +700,7 @@ mod tests {
             max_forward_seek_wait_distance: 16 * 1024 * 1024,
             max_backward_seek_distance: 2 * 1024 * 1024,
             cache_block_size: 1 * MB,
+            max_cursors: DEFAULT_MAX_CURSORS,
         };
 
         // backpressure is enabled but initial read window size is zero
@@ -698,6 +785,7 @@ mod tests {
             max_forward_seek_wait_distance: 16 * 1024 * 1024,
             max_backward_seek_distance: 2 * 1024 * 1024,
             cache_block_size: 1 * MB,
+            max_cursors: DEFAULT_MAX_CURSORS,
         };
 
         let mut get_failures = HashMap::new();
@@ -758,6 +846,7 @@ mod tests {
             max_forward_seek_wait_distance: 1,
             max_backward_seek_distance: 18668,
             cache_block_size: 1 * MB,
+            max_cursors: DEFAULT_MAX_CURSORS,
         };
         run_sequential_read_test(PrefetcherType::Default, object_size, read_size, config);
     }
@@ -787,6 +876,7 @@ mod tests {
             max_forward_seek_wait_distance: test_config.max_forward_seek_wait_distance,
             max_backward_seek_distance: test_config.max_backward_seek_distance,
             initial_request_size: test_config.initial_request_size,
+            max_cursors: test_config.max_cursors,
         };
 
         let prefetcher = build_prefetcher(client, prefetcher_type, prefetcher_config);
@@ -860,6 +950,7 @@ mod tests {
             max_forward_seek_wait_distance: 16 * 1024 * 1024,
             max_backward_seek_distance: 2 * 1024 * 1024,
             cache_block_size: 1 * MB,
+            max_cursors: DEFAULT_MAX_CURSORS,
         };
         run_random_read_test(PrefetcherType::Default, object_size, reads, config);
     }
@@ -876,6 +967,7 @@ mod tests {
             max_forward_seek_wait_distance: 16 * 1024 * 1024,
             max_backward_seek_distance: 2 * 1024 * 1024,
             cache_block_size: 1 * MB,
+            max_cursors: DEFAULT_MAX_CURSORS,
         };
         run_random_read_test(PrefetcherType::Default, object_size, reads, config);
     }
@@ -892,6 +984,7 @@ mod tests {
             max_forward_seek_wait_distance: 2260662,
             max_backward_seek_distance: 2369799,
             cache_block_size: 1 * MB,
+            max_cursors: DEFAULT_MAX_CURSORS,
         };
         run_random_read_test(PrefetcherType::Default, object_size, reads, config);
     }
@@ -908,6 +1001,7 @@ mod tests {
             max_forward_seek_wait_distance: 2810651,
             max_backward_seek_distance: 3531090,
             cache_block_size: 1 * MB,
+            max_cursors: DEFAULT_MAX_CURSORS,
         };
         run_random_read_test(PrefetcherType::Default, object_size, reads, config);
     }
@@ -1197,8 +1291,8 @@ mod tests {
 
             // Reset the cursor via the pool
             let cursor_id = request
-                .cursor
-                .as_ref()
+                .cursors
+                .last()
                 .expect("cursor should still be populated")
                 .cursor_id();
             let pool = request.part_stream.pool();
@@ -1219,6 +1313,293 @@ mod tests {
             let buf = request.read(READ_SIZE as u64, READ_SIZE).await.unwrap();
             assert_eq!(buf.into_bytes().unwrap()[..], expected[READ_SIZE..]);
         });
+    }
+
+    /// Multi-cursor adversarial validation matrix (spec 02, Appendix B). These tests exercise the
+    /// "never worse than today" guarantee and the multi-cursor correctness requirements. They use
+    /// the `MockClient` `GetObject` operation counter as the read-amplification instrument.
+    mod multi_cursor {
+        use super::*;
+        use crate::memory::MINIMUM_MEM_LIMIT;
+        use mountpoint_s3_client::mock_client::Operation;
+        use rand::{RngExt, SeedableRng};
+        use rand_pcg::Pcg64;
+
+        const PART_SIZE: usize = 1 * MB;
+
+        /// Build a mock client backed by a ramp object of the given size, returning the client and
+        /// the object's ETag. Backpressure is enabled with a one-part initial read window (matching
+        /// the real S3 client's behaviour).
+        fn mock_client_with_object(object_size: usize) -> (Arc<MockClient>, ETag) {
+            let client = Arc::new(
+                MockClient::config()
+                    .bucket("test-bucket")
+                    .part_size(PART_SIZE)
+                    .enable_backpressure(true)
+                    .initial_read_window_size(PART_SIZE)
+                    .build(),
+            );
+            let object = MockObject::ramp(0xaa, object_size, ETag::for_tests());
+            let etag = object.etag();
+            client.add_object("hello", object);
+            (client, etag)
+        }
+
+        fn prefetcher_with_max_cursors(client: Arc<MockClient>, max_cursors: usize) -> Prefetcher<Arc<MockClient>> {
+            let config = PrefetcherConfig {
+                max_cursors,
+                ..Default::default()
+            };
+            build_prefetcher(client, PrefetcherType::Default, config)
+        }
+
+        /// Read `length` bytes at `offset` and assert they match the ramp object.
+        async fn read_and_check(request: &mut PrefetchGetObject<Arc<MockClient>>, offset: u64, length: usize) {
+            let buf = request.read(offset, length).await.unwrap();
+            let buf = buf.into_bytes().unwrap();
+            assert_eq!(buf.len(), length, "short read at offset {offset}");
+            let expected = ramp_bytes((0xaa + offset) as usize, length);
+            assert_eq!(&buf[..], &expected[..], "wrong bytes at offset {offset}");
+        }
+
+        /// `(offset, length)` reads for an interleaved round-robin workload: `visits` passes, each
+        /// reading `visit_size` bytes at every one of `num_positions` positions spaced
+        /// `object_size / num_positions` apart. Successive passes advance each position by
+        /// `visit_size`, so every position is a sequential stream the prefetcher tracks as its own
+        /// cursor.
+        fn round_robin_offsets(
+            object_size: usize,
+            num_positions: usize,
+            visit_size: usize,
+            visits: usize,
+        ) -> impl Iterator<Item = (u64, usize)> {
+            let region = object_size / num_positions;
+            (0..visits).flat_map(move |visit| {
+                (0..num_positions).map(move |pos| ((pos * region + visit * visit_size) as u64, visit_size))
+            })
+        }
+
+        /// Two-cursor round-robin should use two cursors.
+        /// Alternating reads from two well-separated positions must return correct data and, once both cursors exist,
+        /// must not issue a new request on every visit (the cursors are reused via switches, not recreated).
+        #[test]
+        fn two_cursor_round_robin_reuses_cursors() {
+            const OBJECT_SIZE: usize = 16 * MB;
+            const VISIT: usize = 128 * KB;
+
+            let (client, etag) = mock_client_with_object(OBJECT_SIZE);
+            let get_counter = client.new_counter(Operation::GetObject);
+            let prefetcher = prefetcher_with_max_cursors(client.clone(), 8);
+            let object_id = ObjectId::new("hello".to_owned(), etag);
+            let mut request = prefetcher.prefetch("test-bucket".to_owned(), object_id, OBJECT_SIZE as u64);
+
+            block_on(async {
+                // Prime both cursors: position 0 and position 8 MiB.
+                read_and_check(&mut request, 0, VISIT).await;
+                read_and_check(&mut request, 8 * MB as u64, VISIT).await;
+                let after_priming = get_counter.count();
+
+                // Now alternate between the two sequential streams for several rounds. Each cursor
+                // serves its own reads sequentially; no new GetObject request should be needed
+                // beyond growing the existing streams' windows.
+                let mut off0 = VISIT as u64;
+                let mut off1 = 8 * MB as u64 + VISIT as u64;
+                for _ in 0..8 {
+                    read_and_check(&mut request, off0, VISIT).await;
+                    read_and_check(&mut request, off1, VISIT).await;
+                    off0 += VISIT as u64;
+                    off1 += VISIT as u64;
+                }
+                let after_rounds = get_counter.count();
+
+                // The alternating rounds are served by the two existing cursors. The request count
+                // may grow modestly as each stream's read window advances, but must not grow by one
+                // request per visit (which would indicate a reset on every switch, i.e. today's
+                // single-cursor behaviour).
+                let extra_requests = after_rounds - after_priming;
+                assert!(
+                    extra_requests < 8,
+                    "expected cursors to be reused across alternation, but issued {extra_requests} \
+                     extra requests over 16 visits (looks like reset-per-switch)"
+                );
+            });
+            // Exactly the two sequential streams should be tracked — the workload genuinely
+            // exercises the multi-cursor path (not a trivial single-cursor pass).
+            assert_eq!(request.tracked_cursors(), 2, "expected exactly two tracked cursors");
+        }
+
+        /// Case B7: a distant read (beyond any cursor's forward reach) creates a new cursor and does
+        /// not corrupt the existing one; returning to the original position still reads correctly.
+        #[test]
+        fn distant_read_creates_new_cursor_without_disturbing_original() {
+            const OBJECT_SIZE: usize = 64 * MB;
+            const VISIT: usize = 128 * KB;
+
+            let (client, etag) = mock_client_with_object(OBJECT_SIZE);
+            let prefetcher = prefetcher_with_max_cursors(client.clone(), 8);
+            let object_id = ObjectId::new("hello".to_owned(), etag);
+            let mut request = prefetcher.prefetch("test-bucket".to_owned(), object_id, OBJECT_SIZE as u64);
+
+            block_on(async {
+                // Establish cursor A near the start.
+                read_and_check(&mut request, 0, VISIT).await;
+                read_and_check(&mut request, VISIT as u64, VISIT).await;
+                // Jump far away (beyond forward reach) — creates cursor B.
+                read_and_check(&mut request, 50 * MB as u64, VISIT).await;
+                // Continue B sequentially.
+                read_and_check(&mut request, 50 * MB as u64 + VISIT as u64, VISIT).await;
+                // Return to A's next sequential position — A must be intact and serve it.
+                read_and_check(&mut request, 2 * VISIT as u64, VISIT).await;
+            });
+            // Both cursor A (near start) and cursor B (at 50 MiB) should be tracked.
+            assert_eq!(
+                request.tracked_cursors(),
+                2,
+                "distant read should have created a second cursor"
+            );
+        }
+
+        /// Core "never worse" gate: a random workload at `max_cursors = 8` must not issue more
+        /// GetObject requests than the same workload at `max_cursors = 1` (the prior single-cursor
+        /// behaviour), plus a small allowance for the up-to-`max_cursors` initial speculative
+        /// requests in flight. This measurement gates whether the near-random fallback (spec req 19)
+        /// is needed.
+        #[test]
+        fn random_read_not_worse_than_single_cursor() {
+            const OBJECT_SIZE: usize = 128 * MB;
+            const READ: usize = 4 * KB;
+            const MULTI_CURSOR_COUNT: usize = 8;
+            // Deterministic pseudo-random offsets, each far from the others.
+            let mut rng = Pcg64::seed_from_u64(0x5eed_1234);
+            let max_offset = (OBJECT_SIZE - READ) as u64;
+            // `& !0xfff` rounds each offset down to a 4 KiB boundary.
+            let offsets: Vec<u64> = (0..200).map(|_| (rng.random_range(0..=max_offset)) & !0xfff).collect();
+
+            // Run the identical offset sequence at a given cursor count; returns
+            // (GetObject request count, number of cursors still tracked at the end).
+            let run = |max_cursors: usize| -> (u64, usize) {
+                let (client, etag) = mock_client_with_object(OBJECT_SIZE);
+                let get_counter = client.new_counter(Operation::GetObject);
+                let prefetcher = prefetcher_with_max_cursors(client.clone(), max_cursors);
+                let object_id = ObjectId::new("hello".to_owned(), etag);
+                let mut request = prefetcher.prefetch("test-bucket".to_owned(), object_id, OBJECT_SIZE as u64);
+                block_on(async {
+                    for &offset in &offsets {
+                        read_and_check(&mut request, offset, READ).await;
+                    }
+                });
+                (get_counter.count(), request.tracked_cursors())
+            };
+
+            let (single, _) = run(1);
+            let (multi, multi_cursors) = run(MULTI_CURSOR_COUNT);
+            // Assertion 1 — the soft cap holds. This workload touches ~200 distinct far-apart
+            // positions, so the tracked set can only stay <= 8 if the LRU is actually evicting
+            // cursors (a broken eviction would let it grow unbounded).
+            assert!(
+                multi_cursors <= MULTI_CURSOR_COUNT,
+                "tracked cursors {multi_cursors} exceeded the max_cursors soft cap of 8"
+            );
+            // Assertion 2 — no request amplification vs. single-cursor. Multi-cursor may issue up to
+            // `max_cursors` extra requests (each new cursor fires one speculative initial GetObject
+            // that a random workload may never reuse); a larger gap means it is amplifying reads on
+            // random access, which the near-random fallback (spec req 19) exists to prevent.
+            assert!(
+                multi <= single + MULTI_CURSOR_COUNT as u64,
+                "random workload amplified requests: single-cursor={single}, 8-cursor={multi}"
+            );
+        }
+
+        /// Multi-cursor doesn't regress a purely sequential read:
+        /// `max_cursors = 8` issues the same number of GetObject requests as with
+        /// `max_cursors = 1`, i.e. multi-cursor tracking adds no requests to
+        /// the common case.
+        #[test]
+        fn sequential_read_no_extra_requests_with_multicursor_enabled() {
+            const OBJECT_SIZE: usize = 32 * MB;
+            const READ: usize = 256 * KB;
+
+            let run = |max_cursors: usize| -> u64 {
+                let (client, etag) = mock_client_with_object(OBJECT_SIZE);
+                let get_counter = client.new_counter(Operation::GetObject);
+                let prefetcher = prefetcher_with_max_cursors(client.clone(), max_cursors);
+                let object_id = ObjectId::new("hello".to_owned(), etag);
+                let mut request = prefetcher.prefetch("test-bucket".to_owned(), object_id, OBJECT_SIZE as u64);
+                block_on(async {
+                    let mut offset = 0u64;
+                    while offset < OBJECT_SIZE as u64 {
+                        read_and_check(&mut request, offset, READ).await;
+                        offset += READ as u64;
+                    }
+                });
+                get_counter.count()
+            };
+
+            assert_eq!(
+                run(1),
+                run(8),
+                "sequential read issued a different number of requests with 8 cursors than with 1"
+            );
+        }
+
+        /// Case 3/8 (memory over-read): quantify peak reserved memory for an interleaved workload
+        /// that keeps many cursors simultaneously live. Request *count* parity does not capture the
+        /// concern that multiple cursors hold in-flight buffered data at once, so we measure reserved
+        /// bytes directly. Multi-cursor legitimately reserves more than a single cursor (that is the
+        /// point — several streams prefetch at once), but it MUST stay bounded by the pool budget.
+        #[test]
+        fn interleaved_peak_memory_is_bounded() {
+            const OBJECT_SIZE: usize = 128 * MB;
+            const VISIT: usize = 128 * KB;
+            const POSITIONS: usize = 8;
+
+            // Reserved memory after driving an interleaved workload across `POSITIONS` positions.
+            let run = |max_cursors: usize| -> usize {
+                let (client, etag) = mock_client_with_object(OBJECT_SIZE);
+
+                client_pool_reserved_probe(&client, max_cursors, &etag, OBJECT_SIZE, POSITIONS, VISIT)
+            };
+
+            let single = run(1);
+            let multi = run(8);
+            let budget = MINIMUM_MEM_LIMIT;
+
+            // Multi-cursor may reserve more (multiple live streams), but must remain within the pool
+            // budget — the global bound the memory pruner enforces. This is the "memory stays
+            // bounded" guarantee; it is NOT required to be <= single-cursor.
+            assert!(
+                multi <= budget,
+                "multi-cursor reserved {multi} bytes, exceeding pool budget {budget}"
+            );
+            // Sanity: single-cursor is also bounded (guards the probe itself).
+            assert!(
+                single <= budget,
+                "single-cursor reserved {single} exceeds budget {budget}"
+            );
+        }
+
+        /// Drive an interleaved workload and return the pool's reserved-bytes high-water estimate
+        /// (`mem_limit - available`) sampled at the end, when all cursors are live.
+        fn client_pool_reserved_probe(
+            client: &Arc<MockClient>,
+            max_cursors: usize,
+            etag: &ETag,
+            object_size: usize,
+            positions: usize,
+            visit: usize,
+        ) -> usize {
+            let prefetcher = prefetcher_with_max_cursors(client.clone(), max_cursors);
+            let pool = prefetcher.part_stream.pool().clone();
+            let object_id = ObjectId::new("hello".to_owned(), etag.clone());
+            let mut request = prefetcher.prefetch("test-bucket".to_owned(), object_id, object_size as u64);
+            block_on(async {
+                // Two interleaved rounds so every position has an established, live cursor.
+                for (offset, length) in round_robin_offsets(object_size, positions, visit, 2) {
+                    read_and_check(&mut request, offset, length).await;
+                }
+            });
+            pool.mem_limit().saturating_sub(pool.memory_available_for_reservation())
+        }
     }
 
     #[cfg(feature = "shuttle")]

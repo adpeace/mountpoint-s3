@@ -100,7 +100,10 @@ Mountpoint emits the following metrics:
 | `experimental.fuse.cache_hit` | Counter | | Number of FUSE requests fully served from [data cache](CONFIGURATION.md#data-cache)<br> (Prefetched data served from memory or partial cache hits are not included in this metric) |
 | `experimental.fuse.idle_threads` | Histogram | | FUSE worker threads waiting for new requests |
 | `experimental.fuse.total_threads` | Gauge | | Total number of FUSE worker threads spawned |
-| `experimental.prefetch.reset_state` | Counter | | Times Mountpoint discarded prefetched data due to access patterns |
+| `experimental.prefetch.reset_state` | Counter | | Times Mountpoint discarded all prefetched data for a file handle (a hard reset, e.g. on a read error). Does not count the routine creation of an additional read cursor |
+| `experimental.prefetch.cursor_created` | Counter | | Times a new sequential read cursor was created for a file handle because no existing cursor could serve the read. The first read of a handle creates one cursor; further cursors are created for additional interleaved sequential streams, up to `--max-cursors` |
+| `experimental.prefetch.cursor_switches` | Counter | | Times a read was served by switching to a different already-tracked cursor (rather than the most-recently-used one), i.e. interleaving between concurrent sequential streams on one file handle |
+| `experimental.prefetch.cursor_evicted` | Counter | | Times a least-recently-used cursor was evicted to make room for a new one because the `--max-cursors` cap was reached, cancelling its in-flight request. A sustained rate relative to `cursor_created` means the workload has more concurrent sequential streams than `--max-cursors` allows |
 
 > [!NOTE]
 > Metrics prefixed with `experimental.` may change or be removed in future versions.

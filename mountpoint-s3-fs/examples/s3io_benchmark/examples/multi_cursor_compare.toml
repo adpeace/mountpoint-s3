@@ -1,0 +1,34 @@
+# Multi-cursor throughput comparison.
+#
+# This config runs a sequential baseline alongside the multi-cursor interleaved
+# read pattern, with the multi-cursor prefetcher enabled (`max_cursors = 8`).
+#
+# Run:
+#   cargo run --release --example s3io_benchmark -- \
+#     mountpoint-s3-fs/examples/s3io_benchmark/examples/multi_cursor_compare.toml
+
+[global]
+bucket = "amzn-s3-demo-bucket"
+region = "us-east-1"
+read_size = 131072       # 128 KiB, a typical FUSE read size
+iterations = 3
+max_cursors = 8          # multi-cursor enabled
+
+# Sequential baseline: single sequential stream over the whole object.
+[jobs.sequential_baseline]
+workload_type = "read"
+object_key = "multi-cursor-benchmark-1GiB.bin"
+object_size = 1073741824  # 1 GiB
+access_pattern = "sequential"
+
+# Multi-cursor: 8 interleaved sequential cursors, 1 MiB read from each before
+# advancing to the next. This is the pattern that regressed to random-read
+# throughput before multi-cursor prefetching.
+[jobs.multi_cursor]
+workload_type = "read"
+object_key = "multi-cursor-benchmark-1GiB.bin"
+object_size = 1073741824  # 1 GiB
+access_pattern = "multi_cursor_sequential"
+num_cursors = 8
+bytes_per_cursor_visit = 1048576  # 1 MiB
+generate_object = false           # created by sequential_baseline above

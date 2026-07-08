@@ -1,0 +1,31 @@
+# Multi-cursor throughput comparison - single-cursor baseline.
+#
+# Identical to multi_cursor_compare.toml except `max_cursors = 1`, which restores
+# the pre-multi-cursor behaviour (a reset on every cursor switch).
+#
+# Run:
+#   cargo run --release --example s3io_benchmark -- \
+#     mountpoint-s3-fs/examples/s3io_benchmark/examples/multi_cursor_compare_single.toml
+
+[global]
+bucket = "amzn-s3-demo-bucket"
+region = "us-east-1"
+read_size = 131072
+iterations = 3
+max_cursors = 1          # single-cursor baseline (today's behaviour)
+
+[jobs.sequential_baseline]
+workload_type = "read"
+object_key = "multi-cursor-benchmark-1GiB.bin"
+object_size = 1073741824  # 1 GiB
+access_pattern = "sequential"
+generate_object = false   # created by the max_cursors=8 run
+
+[jobs.multi_cursor]
+workload_type = "read"
+object_key = "multi-cursor-benchmark-1GiB.bin"
+object_size = 1073741824  # 1 GiB
+access_pattern = "multi_cursor_sequential"
+num_cursors = 8
+bytes_per_cursor_visit = 1048576  # 1 MiB
+generate_object = false

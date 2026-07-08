@@ -31,6 +31,9 @@
 //! is handed to the ObjectPartStream where the stream should call a provided function "before" fetching
 //! more data from the sources and put them into the part queue. The BackpressureLimiter should be used
 //! as a mean to block ObjectPartStream thread to fetch more data.
+//!
+//! Note: the trace events emitted by this file are parsed by the cursor visualisation tool in
+//! `tools/prefetch-visualizer`. Take care if changing their message or field content.
 
 use std::fmt::Debug;
 

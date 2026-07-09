@@ -58,6 +58,7 @@ mod seek_window;
 mod task;
 
 pub use builder::PrefetcherBuilder;
+use cursor::CursorRead;
 pub use cursor::{Cursor, CursorId};
 use part::PartOperationError;
 use part_stream::{PartStream, RequestRange, RequestTaskConfig};
@@ -326,32 +327,63 @@ where
         // Try the MRU cursor first to avoid a sequential read on it being captured by another
         // cursor with an overlapping read window.
         if let Some(active) = self.cursors.last()
-            && let Some(result) = active.try_read(offset, length).await?
+            && let Some(read) = active.try_read(offset, length).await?
         {
-            return Ok(result);
+            // If the cursor reached its bound, recompute cursor bounds so that it may continue
+            // forwards if the next cursor has moved on.
+            if read.bound_reached {
+                self.recompute_cursor_bounds().await;
+            }
+            return Ok((read.data, read.from_cache));
         }
 
         // The active cursor couldn't serve the read: check if any other cursor can, and select the
         // one closest to the read position. Note that the cursors might mutate between the check and
         // the try_read attempt, so even if a cursor is selected it may become ineligible and we fall
         // through to cursor creation anyway.
-        if let Some(index) = self.select_cursor(offset).await {
-            if let Some(result) = self.cursors[index].try_read(offset, length).await? {
-                // We switched to a non-active cursor (`select_cursor` never returns the active
-                // cursor): make it the active (most-recently-used) cursor by moving it to the end.
-                metrics::counter!(PREFETCH_CURSOR_SWITCHES).increment(1);
-                let cursor = self.cursors.remove(index);
-                self.cursors.push(cursor);
-                return Ok(result);
+        if let Some(index) = self.select_cursor(offset).await
+            && let Some(read) = self.cursors[index].try_read(offset, length).await?
+        {
+            // We switched to a non-active cursor (`select_cursor` never returns the active cursor):
+            // make it the active (most-recently-used) cursor by moving it to the end.
+            metrics::counter!(PREFETCH_CURSOR_SWITCHES).increment(1);
+            let cursor = self.cursors.remove(index);
+            self.cursors.push(cursor);
+            // See above: a read past its bound means the bound is stale, so recompute.
+            if read.bound_reached {
+                self.recompute_cursor_bounds().await;
             }
+            return Ok((read.data, read.from_cache));
         }
 
         // No tracked cursor can serve the read: create a new one at `offset`, starting a new S3
         // request.
-        let (cursor, result) = self.read_from_new_cursor(offset, length).await?;
+        let (cursor, read) = self.read_from_new_cursor(offset, length).await?;
         metrics::counter!(PREFETCH_CURSOR_CREATED).increment(1);
         self.push_cursor(cursor);
-        Ok(result)
+        // The tracked set changed (a cursor was added, possibly one evicted), so recompute each
+        // cursor's forward window bound to keep it from fetching into the next cursor's region.
+        self.recompute_cursor_bounds().await;
+        Ok((read.data, read.from_cache))
+    }
+
+    /// Bound each tracked cursor's read-window growth at the current read position of the nearest
+    /// cursor ahead of it, so no cursor fetches into another cursor's region (which causes
+    /// over-fetch and read "capture"). A cursor with no other cursor ahead of it (the frontmost, and
+    /// the single-cursor case) is left unbounded, so sequential reads are unaffected.
+    ///
+    /// Called on tracked-set changes only. Between changes cursors only advance forward, which
+    /// merely relaxes the correct bound, so a slightly stale bound is always conservative (it never
+    /// permits over-fetch, only limits growth a little).
+    async fn recompute_cursor_bounds(&self) {
+        // Snapshot each cursor's current read position (skips any reset by the memory limiter).
+        let mut offsets = Vec::with_capacity(self.cursors.len());
+        for cursor in &self.cursors {
+            offsets.push(cursor.current_offset().await);
+        }
+        for (i, cursor) in self.cursors.iter().enumerate() {
+            cursor.set_window_upper_bound(nearest_ahead_bound(i, &offsets)).await;
+        }
     }
 
     /// Find the index of the tracked cursor best able to serve a read at `offset`, if any. Among
@@ -397,7 +429,7 @@ where
         &self,
         offset: u64,
         initial_read_length: usize,
-    ) -> Result<(Cursor<Client>, (ChecksummedBytes, bool)), PrefetchReadError<Client::ClientError>> {
+    ) -> Result<(Cursor<Client>, CursorRead), PrefetchReadError<Client::ClientError>> {
         let object_size = self.size as usize;
         let client = self.part_stream.client();
 
@@ -449,6 +481,41 @@ where
     fn tracked_cursors(&self) -> usize {
         self.cursors.len()
     }
+
+    /// Per-cursor `(current_offset, window_upper_bound)` for every live cursor, in tracking order.
+    /// Test-only introspection used to assert that per-cursor window bounds are recomputed — and
+    /// relaxed — as cursors advance and the tracked set changes.
+    #[cfg(test)]
+    async fn cursor_bounds_snapshot(&self) -> Vec<(u64, Option<u64>)> {
+        let mut snapshot = Vec::with_capacity(self.cursors.len());
+        for cursor in &self.cursors {
+            if let Some(entry) = cursor.current_offset_and_bound().await {
+                snapshot.push(entry);
+            }
+        }
+        snapshot
+    }
+}
+
+/// The window upper bound for the cursor at `index`: the position of the nearest cursor ahead of
+/// it, or `None` if none is ahead (the frontmost cursor, and the single-cursor case, are left
+/// unbounded). `offsets` holds each tracked cursor's current read position in tracking order, with
+/// `None` for a cursor reset by the memory limiter.
+///
+/// A cursor counts as "ahead" of the one at `index` if its position is strictly greater, or equal
+/// but tracked later (higher index). The tie-break matters: among cursors sitting at the same
+/// offset, exactly one (the most-recently-used, highest index) is left unbounded and the rest are
+/// bounded at that shared offset. Without it, two cursors at the same offset would each see the
+/// other as "not ahead", both grow a read window over the identical region, and fetch it twice.
+fn nearest_ahead_bound(index: usize, offsets: &[Option<u64>]) -> Option<u64> {
+    let own = offsets[index]?;
+    offsets
+        .iter()
+        .enumerate()
+        .filter_map(|(other, offset)| offset.map(|offset| (other, offset)))
+        .filter(|&(other, offset)| offset > own || (offset == own && other > index))
+        .map(|(_, offset)| offset)
+        .min()
 }
 
 #[cfg(test)]
@@ -1459,6 +1526,180 @@ mod tests {
             );
         }
 
+        /// A cursor's window bound must *relax* when the cursor ahead of it advances. The bound is
+        /// recomputed only when the tracked set changes (a cursor is created); between those events
+        /// a downstream cursor can move forward, leaving a trailing cursor's bound stale-but-safe.
+        /// The next recompute must widen the trailing bound to the downstream cursor's new position —
+        /// otherwise a bound set early would permanently throttle a cursor whose neighbour has since
+        /// moved far ahead.
+        #[test]
+        fn cursor_window_bound_relaxes_as_downstream_cursor_advances() {
+            const OBJECT_SIZE: usize = 128 * MB;
+            const VISIT: usize = 128 * KB;
+            const A_START: u64 = 0;
+            const B_START: u64 = 40 * MB as u64;
+            const C_START: u64 = 80 * MB as u64;
+
+            let (client, etag) = mock_client_with_object(OBJECT_SIZE);
+            let prefetcher = prefetcher_with_max_cursors(client.clone(), 8);
+            let object_id = ObjectId::new("hello".to_owned(), etag);
+            let mut request = prefetcher.prefetch("test-bucket".to_owned(), object_id, OBJECT_SIZE as u64);
+
+            block_on(async {
+                // Cursor A near the start.
+                read_and_check(&mut request, A_START, VISIT).await;
+                // Distant read creates cursor B ahead of A; creating it recomputes bounds, so A is
+                // now bounded at B's current position and B (frontmost) is unbounded.
+                read_and_check(&mut request, B_START, VISIT).await;
+
+                let snapshot = request.cursor_bounds_snapshot().await;
+                let mut sorted = snapshot.clone();
+                sorted.sort_by_key(|(off, _)| *off);
+                let (_, a_bound_before) = sorted[0];
+                let (b_current_before, b_bound) = sorted[1];
+                assert_eq!(
+                    a_bound_before,
+                    Some(b_current_before),
+                    "A should be bounded at B's initial position"
+                );
+                assert_eq!(b_bound, None, "frontmost cursor B should be unbounded");
+
+                // Advance B well forward via the fast path (active cursor). This does NOT recompute
+                // bounds, so A's bound stays at B's *old* position (stale but conservative).
+                let b_target = B_START + 8 * MB as u64;
+                let mut b_off = B_START + VISIT as u64;
+                while b_off < b_target {
+                    read_and_check(&mut request, b_off, VISIT).await;
+                    b_off += VISIT as u64;
+                }
+                let stale = request.cursor_bounds_snapshot().await;
+                let mut stale_sorted = stale.clone();
+                stale_sorted.sort_by_key(|(off, _)| *off);
+                assert_eq!(
+                    stale_sorted[0].1, a_bound_before,
+                    "A's bound must not change without a tracked-set change (recompute is create-only)"
+                );
+
+                // A third distant read creates cursor C, recomputing bounds. A's nearest cursor ahead
+                // is still B, but B has advanced — so A's bound must relax to B's new position.
+                read_and_check(&mut request, C_START, VISIT).await;
+
+                let after = request.cursor_bounds_snapshot().await;
+                let mut after_sorted = after.clone();
+                after_sorted.sort_by_key(|(off, _)| *off);
+                assert_eq!(after_sorted.len(), 3, "A, B, C should all be tracked");
+                let (_, a_bound_after) = after_sorted[0];
+                let (b_current_after, b_bound_after) = after_sorted[1];
+                let (c_current, c_bound) = after_sorted[2];
+
+                // The relaxation: A's bound widened to B's new (larger) position.
+                assert_eq!(
+                    a_bound_after,
+                    Some(b_current_after),
+                    "A should be re-bounded at B's new position"
+                );
+                assert!(
+                    a_bound_after.unwrap() > a_bound_before.unwrap(),
+                    "A's bound should have relaxed as B advanced: {:?} -> {:?}",
+                    a_bound_before,
+                    a_bound_after
+                );
+                // The middle cursor B is now bounded at C; C (frontmost) is unbounded.
+                assert_eq!(b_bound_after, Some(c_current), "B should be bounded at C's position");
+                assert_eq!(c_bound, None, "frontmost cursor C should be unbounded");
+            });
+        }
+
+        /// A trailing cursor that reads *forward past its own (stale) bound* must have that bound
+        /// relaxed — without any new cursor being created. This is the read-past-bound trigger: once
+        /// the trailing cursor reads through the region the downstream cursor has vacated, the bound
+        /// is recomputed against the downstream cursor's current position, so the window can grow
+        /// again. (Distinct from `cursor_window_bound_relaxes_as_downstream_cursor_advances`, which
+        /// relaxes via a *new cursor creation*.)
+        #[test]
+        fn cursor_window_bound_relaxes_when_read_crosses_it() {
+            const OBJECT_SIZE: usize = 128 * MB;
+            const READ: usize = 1 * MB;
+            // B must be far enough ahead of A that it is created as a separate cursor (beyond A's
+            // forward reach), matching the distant-read convention used elsewhere.
+            const B_START: u64 = 50 * MB as u64;
+            const B_ADVANCED: u64 = 58 * MB as u64;
+
+            let (client, etag) = mock_client_with_object(OBJECT_SIZE);
+            let prefetcher = prefetcher_with_max_cursors(client.clone(), 8);
+            let object_id = ObjectId::new("hello".to_owned(), etag);
+            let mut request = prefetcher.prefetch("test-bucket".to_owned(), object_id, OBJECT_SIZE as u64);
+
+            block_on(async {
+                // Cursor A at offset 0.
+                read_and_check(&mut request, 0, READ).await;
+                // Distant read creates cursor B, bounding A at B's start (50 MiB).
+                read_and_check(&mut request, B_START, READ).await;
+                // Advance B forward to ~58 MiB (sequential reads on B). No new cursor is created, so
+                // A's bound stays stale at 50 MiB.
+                let mut b_off = B_START + READ as u64;
+                while b_off < B_ADVANCED {
+                    read_and_check(&mut request, b_off, READ).await;
+                    b_off += READ as u64;
+                }
+
+                // Precondition: A's bound is stale — it reflects an *earlier* B position, well below
+                // where B has now advanced to. (The bound was last set when B was created / the last
+                // recompute ran, so it trails B's current position.)
+                let before = {
+                    let mut s = request.cursor_bounds_snapshot().await;
+                    s.sort_by_key(|(off, _)| *off);
+                    s
+                };
+                let (_, a_bound_before) = before[0];
+                let (b_current_before, _) = before[1];
+                let a_bound_before = a_bound_before.expect("A should be bounded while B is ahead");
+                assert!(
+                    a_bound_before < b_current_before,
+                    "A's bound {a_bound_before} should be stale (below B's advanced position {b_current_before})"
+                );
+
+                // Drive A forward from 1 MiB across its stale bound (~51 MiB) toward B. We stop a few
+                // parts short of B (55 MiB, with B at ~58 MiB) so B never back-seeks to serve A's
+                // reads (its backward seek window is only `max_backward_seek_distance` = 1 MiB) — A
+                // serves them itself, and the read that reaches its stale bound triggers a recompute
+                // against B's current position, relaxing the bound so A can keep advancing.
+                let a_target = B_ADVANCED - 3 * READ as u64;
+                let mut a_off = READ as u64;
+                while a_off <= a_target {
+                    read_and_check(&mut request, a_off, READ).await;
+                    a_off += READ as u64;
+                }
+
+                let after = {
+                    let mut s = request.cursor_bounds_snapshot().await;
+                    s.sort_by_key(|(off, _)| *off);
+                    s
+                };
+                // Still exactly A and B tracked (no new cursor created by the traversal).
+                assert_eq!(after.len(), 2, "no new cursor should have been created");
+                let (a_current_after, a_bound_after) = after[0];
+                let (b_current_after, _) = after[1];
+                // A read past its old bound, so its bound relaxed to B's current position — strictly
+                // larger than the stale value, letting A's window grow through the region again.
+                assert!(
+                    a_current_after > a_bound_before,
+                    "A should have read past its old bound"
+                );
+                assert_eq!(
+                    a_bound_after,
+                    Some(b_current_after),
+                    "A should be re-bounded at B's current position after crossing its stale bound"
+                );
+                assert!(
+                    a_bound_after.unwrap() > a_bound_before,
+                    "A's bound should have relaxed past its stale value: {:?} -> {:?}",
+                    Some(a_bound_before),
+                    a_bound_after
+                );
+            });
+        }
+
         /// Core "never worse" gate: a random workload at `max_cursors = 8` must not issue more
         /// GetObject requests than the same workload at `max_cursors = 1` (the prior single-cursor
         /// behaviour), plus a small allowance for the up-to-`max_cursors` initial speculative
@@ -1599,6 +1840,76 @@ mod tests {
                 }
             });
             pool.mem_limit().saturating_sub(pool.memory_available_for_reservation())
+        }
+
+        /// `nearest_ahead_bound` bounds a cursor at the position of the nearest cursor ahead of it,
+        /// and leaves only the frontmost cursor unbounded.
+        #[test]
+        fn nearest_ahead_bound_orders_distinct_offsets() {
+            // Cursors at 0, 80, 40 (tracking order arbitrary): each is bounded at the next-ahead
+            // position, and the frontmost (80) is unbounded.
+            let offsets = [Some(0), Some(80), Some(40)];
+            assert_eq!(nearest_ahead_bound(0, &offsets), Some(40), "cursor at 0 -> next is 40");
+            assert_eq!(
+                nearest_ahead_bound(1, &offsets),
+                None,
+                "frontmost cursor (80) is unbounded"
+            );
+            assert_eq!(nearest_ahead_bound(2, &offsets), Some(80), "cursor at 40 -> next is 80");
+        }
+
+        /// Regression for the equal-offset double-fetch bug: two cursors sitting at the *same* offset
+        /// must not both come away unbounded. Exactly one (the highest-indexed, most-recently-used)
+        /// stays unbounded; the rest are bounded at that shared offset so they don't grow a window
+        /// over — and re-fetch — the identical region. A strict "> own" comparison would leave both
+        /// unbounded.
+        #[test]
+        fn nearest_ahead_bound_breaks_equal_offset_ties() {
+            // Two cursors at 40, one leader at 80. The lower-indexed 40 is bounded at its equal-offset
+            // peer; the higher-indexed 40 is bounded at the leader; the leader is unbounded.
+            let offsets = [Some(40), Some(40), Some(80)];
+            assert_eq!(
+                nearest_ahead_bound(0, &offsets),
+                Some(40),
+                "lower-indexed equal-offset cursor is bounded at its peer (not left unbounded)"
+            );
+            assert_eq!(
+                nearest_ahead_bound(1, &offsets),
+                Some(80),
+                "higher-indexed equal-offset cursor is bounded at the leader ahead"
+            );
+            assert_eq!(nearest_ahead_bound(2, &offsets), None, "leader (80) is unbounded");
+
+            // Three cursors all at the same offset: only the last stays unbounded, so exactly one
+            // window grows over the region rather than three.
+            let all_equal = [Some(40), Some(40), Some(40)];
+            assert_eq!(nearest_ahead_bound(0, &all_equal), Some(40));
+            assert_eq!(nearest_ahead_bound(1, &all_equal), Some(40));
+            assert_eq!(
+                nearest_ahead_bound(2, &all_equal),
+                None,
+                "only the last equal cursor is unbounded"
+            );
+        }
+
+        /// A cursor reset by the memory limiter (position `None`) is skipped as a bound candidate,
+        /// and asking for the bound of a reset cursor yields `None`.
+        #[test]
+        fn nearest_ahead_bound_ignores_reset_cursors() {
+            // The cursor ahead (index 1) has been reset, so index 0 falls through to the next live
+            // cursor ahead (index 2 at 80) rather than being bounded at a vacated slot.
+            let offsets = [Some(0), None, Some(80)];
+            assert_eq!(
+                nearest_ahead_bound(0, &offsets),
+                Some(80),
+                "skip reset cursor, bound at next live one"
+            );
+            assert_eq!(nearest_ahead_bound(1, &offsets), None, "reset cursor has no bound");
+            assert_eq!(
+                nearest_ahead_bound(2, &offsets),
+                None,
+                "frontmost live cursor is unbounded"
+            );
         }
     }
 

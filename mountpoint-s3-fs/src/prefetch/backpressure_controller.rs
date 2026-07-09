@@ -107,6 +107,12 @@ pub struct BackpressureController {
     cursor_state: Arc<CursorState>,
     /// Enable alignment of read window end to part boundary
     read_window_alignment_config: ReadWindowAlignmentConfig,
+    /// Optional upper bound (exclusive) on how far the read window may be advanced, independent of
+    /// `request_end_offset`. Used in the multi-cursor case to stop a cursor's window from growing
+    /// into the next tracked cursor's region (which would cause it to fetch data another cursor
+    /// owns, and to "capture" reads for that region). `None` means unbounded, so the single-cursor
+    /// path is unaffected.
+    window_upper_bound: Option<u64>,
 }
 
 /// The [BackpressureLimiter] is used on producer side of a stream, for example,
@@ -154,6 +160,7 @@ pub fn new_backpressure_controller(
         read_window_end_offset,
         next_read_offset: config.request_range.start,
         request_end_offset: config.request_range.end,
+        window_upper_bound: None,
         cursor_state,
         read_window_alignment_config: config.read_window_alignment_config,
     };
@@ -173,6 +180,31 @@ pub fn new_backpressure_controller(
 impl BackpressureController {
     pub fn read_window_end_offset(&self) -> u64 {
         self.read_window_end_offset
+    }
+
+    /// Set (or clear, with `None`) the exclusive upper bound on read-window growth. The window is
+    /// never shrunk below where it already reached — this only limits *future* growth — so it is
+    /// safe to call at any time. See [Self::window_upper_bound].
+    pub fn set_window_upper_bound(&mut self, bound: Option<u64>) {
+        self.window_upper_bound = bound;
+    }
+
+    /// The current exclusive upper bound on read-window growth, if any. Test-only introspection used
+    /// to assert that per-cursor bounds are recomputed (and relaxed) as the tracked set changes.
+    #[cfg(test)]
+    pub fn window_upper_bound(&self) -> Option<u64> {
+        self.window_upper_bound
+    }
+
+    /// Whether the read position has reached (or passed) the window upper bound. When true, this
+    /// cursor is no longer prefetching speculatively ahead of the next cursor — it is reading
+    /// *through* a region that cursor has vacated or finished, so its (now stale) bound is pure
+    /// throttle. The prefetcher uses this as a signal to recompute per-cursor bounds against the
+    /// downstream cursor's current position. Always false when unbounded.
+    #[inline]
+    pub fn read_reached_window_bound(&self) -> bool {
+        self.window_upper_bound
+            .is_some_and(|bound| self.next_read_offset >= bound)
     }
 
     /// Send a feedback to the backpressure controller when reading data out of the stream. The backpressure controller
@@ -196,10 +228,23 @@ impl BackpressureController {
                     let new_read_window_end_offset_aligned = self
                         .read_window_alignment_config
                         .align(new_read_window_end_offset_preferred);
-                    // NOTE: in the end of the object we still have up to "part_size" of unaccounted memory.
-                    // For more accurate memory limiting we could reserve in "full parts", but that would make
-                    // release more complicated. So accept this inaccuracy, and reserve only till `request_end_offset`.
-                    let new_read_window_end_offset = new_read_window_end_offset_aligned.min(self.request_end_offset);
+                    // NOTE: in the end of the object we still have up to "part_size" of unaccounted memory. For more
+                    // accurate memory limiting we could reserve in "full parts", but that would make release more
+                    // complicated. So accept this inaccuracy, and reserve only till `request_end_offset`. Also clamp to
+                    // `window_upper_bound` when set, so a cursor doesn't grow its window into the next tracked cursor's
+                    // region (multi-cursor over-fetch / capture).
+                    //
+                    // The bound limits prefetch, but must also not starve data the reader is actively consuming, so
+                    // always allow the window to reach at least `min_read_window_size` past the current read position.
+                    // Otherwise the producer would never deliver the part the reader is blocked on and the read would
+                    // deadlock (reproduced/validated by proptest).
+                    let progress_floor = self.next_read_offset.saturating_add(self.min_read_window_size as u64);
+                    let upper_bound = self
+                        .window_upper_bound
+                        .map_or(u64::MAX, |bound| bound.max(progress_floor));
+                    let new_read_window_end_offset = new_read_window_end_offset_aligned
+                        .min(self.request_end_offset)
+                        .min(upper_bound);
                     // We can skip if the new `read_window_end_offset` is less than or equal to the current one, this
                     // could happen after the read window is scaled down.
                     if new_read_window_end_offset <= self.read_window_end_offset {
@@ -443,6 +488,142 @@ mod tests {
             backpressure_controller.preferred_read_window_size, backpressure_controller.min_read_window_size,
             "should have scaled down to min read window size"
         );
+    }
+
+    /// Requirement 23 / Option B: with a `window_upper_bound` set, the read window MUST NOT grow
+    /// past it — except for the `min_read_window_size` progress floor that guarantees the reader is
+    /// never starved (removing that floor deadlocks; see `progress_floor` in `send_feedback`).
+    ///
+    /// We set a bound, then drive the controller to grow aggressively (scale up + repeated
+    /// `DataRead` feedback) toward the bound while the read position stays well behind it. Without
+    /// the `.min(upper_bound)` clamp the window blows past the bound; with it the window stops at
+    /// the bound. This is the deterministic analogue of a trailing cursor's window trying to run
+    /// into the next cursor's region.
+    #[test]
+    fn read_window_does_not_grow_past_upper_bound() {
+        const KIB: usize = 1024;
+        const MIB: usize = 1024 * KIB;
+        const GIB: u64 = 1024 * MIB as u64;
+
+        #[allow(clippy::identity_op)]
+        let backpressure_config = BackpressureConfig {
+            initial_read_window_size: 1 * MIB,
+            min_read_window_size: 1 * MIB,
+            max_read_window_size: 2 * GIB as usize,
+            read_window_size_multiplier: 2,
+            request_range: 0..(5 * GIB),
+            read_window_alignment_config: ReadWindowAlignmentConfig::Disable,
+        };
+        let (mut controller, _limiter) = new_backpressure_controller_for_test(backpressure_config);
+
+        // The next cursor ahead sits at 64 MiB; the trailing cursor must not fetch past it (beyond
+        // the 1 MiB progress floor).
+        const BOUND: u64 = 64 * MIB as u64;
+        const FLOOR: u64 = MIB as u64;
+        controller.set_window_upper_bound(Some(BOUND));
+
+        block_on(async {
+            // Read position advances slowly and stays far below the bound, but we scale the preferred
+            // window up big and feed enough DataRead events that, unbounded, the window would grow to
+            // `next_read_offset + preferred_read_window_size` — well past BOUND.
+            let mut offset = 0u64;
+            let read_len = MIB;
+            for _ in 0..16 {
+                // Simulate the reader draining its queue (drives `scale_up`, doubling preferred size).
+                controller
+                    .send_feedback::<MockClientError>(BackpressureFeedbackEvent::PartQueueStall)
+                    .await
+                    .unwrap();
+                controller
+                    .send_feedback::<MockClientError>(BackpressureFeedbackEvent::DataRead {
+                        offset,
+                        length: read_len,
+                    })
+                    .await
+                    .unwrap();
+                offset += read_len as u64;
+
+                // Invariant under test: the window never exceeds the bound plus the progress floor
+                // relative to the current read position.
+                let allowed = BOUND.max(controller.next_read_offset + FLOOR);
+                assert!(
+                    controller.read_window_end_offset <= allowed,
+                    "read window {} exceeded bound {} (allowed {}, read pos {})",
+                    controller.read_window_end_offset,
+                    BOUND,
+                    allowed,
+                    controller.next_read_offset,
+                );
+            }
+
+            // Sanity: the window actually grew to the bound (otherwise the clamp was never exercised
+            // and the test would pass vacuously). The preferred window scaled up past BOUND, so the
+            // clamp is what held it here.
+            assert_eq!(
+                controller.read_window_end_offset, BOUND,
+                "expected the window to grow up to (and stop at) the bound",
+            );
+        });
+    }
+
+    /// `read_reached_window_bound` reports whether the read position has reached the window bound —
+    /// the signal the prefetcher uses to recompute a stale bound. False when unbounded, false while
+    /// the read stays behind the bound, true once it reaches/passes it.
+    #[test]
+    fn read_reached_window_bound_reports_crossing() {
+        const KIB: usize = 1024;
+        const MIB: usize = 1024 * KIB;
+        const GIB: u64 = 1024 * MIB as u64;
+
+        #[allow(clippy::identity_op)]
+        let backpressure_config = BackpressureConfig {
+            initial_read_window_size: 1 * MIB,
+            min_read_window_size: 1 * MIB,
+            max_read_window_size: 2 * GIB as usize,
+            read_window_size_multiplier: 2,
+            request_range: 0..(5 * GIB),
+            read_window_alignment_config: ReadWindowAlignmentConfig::Disable,
+        };
+        let (mut controller, _limiter) = new_backpressure_controller_for_test(backpressure_config);
+
+        // Unbounded: never "reached".
+        assert!(
+            !controller.read_reached_window_bound(),
+            "unbounded cursor never reaches a bound"
+        );
+
+        const BOUND: u64 = 16 * MIB as u64;
+        controller.set_window_upper_bound(Some(BOUND));
+
+        block_on(async {
+            // Read up to just before the bound — still behind it.
+            controller
+                .send_feedback::<MockClientError>(BackpressureFeedbackEvent::DataRead {
+                    offset: BOUND - 2 * MIB as u64,
+                    length: MIB,
+                })
+                .await
+                .unwrap();
+            assert!(
+                !controller.read_reached_window_bound(),
+                "read position {} is still behind bound {BOUND}",
+                controller.next_read_offset
+            );
+
+            // Read up to exactly the bound — now reached.
+            controller
+                .send_feedback::<MockClientError>(BackpressureFeedbackEvent::DataRead {
+                    offset: BOUND - (MIB as u64),
+                    length: MIB,
+                })
+                .await
+                .unwrap();
+            assert!(
+                controller.read_reached_window_bound(),
+                "read position {} has reached bound {BOUND}",
+                controller.next_read_offset
+            );
+        });
     }
 
     #[test]

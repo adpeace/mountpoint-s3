@@ -31,6 +31,21 @@ where
     max_forward_seek_wait_distance: u64,
 }
 
+/// The result of a read served by a [Cursor].
+#[derive(Debug)]
+pub struct CursorRead {
+    /// The bytes read.
+    pub data: ChecksummedBytes,
+    /// Whether every part of this read came from the cache (disk/express) rather than S3. Used by
+    /// the FUSE layer to record cache hits.
+    pub from_cache: bool,
+    /// Whether the read reached (or passed) this cursor's window upper bound. When true, the
+    /// cursor's bound has gone stale (the downstream cursor it was bounded against has vacated or
+    /// finished), and the prefetcher should recompute per-cursor bounds. Always false for an
+    /// unbounded cursor. See [super::task::RequestTask::read_reached_window_bound].
+    pub bound_reached: bool,
+}
+
 /// The resettable portion of a cursor: the request task and backward seek buffer.
 #[derive(Debug)]
 struct CursorInner<Client: ObjectClient + Clone + Send + Sync + 'static> {
@@ -58,7 +73,7 @@ where
         object_id: ObjectId,
         offset: u64,
         initial_read_length: usize,
-    ) -> Result<(Self, (ChecksummedBytes, bool)), PrefetchReadError<Client::ClientError>> {
+    ) -> Result<(Self, CursorRead), PrefetchReadError<Client::ClientError>> {
         let cursor_id = cursor_handle.id();
         let backward_seek_window = Arc::new(Mutex::new(SeekWindow::new(config.max_backward_seek_distance as usize)));
         {
@@ -115,7 +130,7 @@ where
         &self,
         offset: u64,
         length: usize,
-    ) -> Result<Option<(ChecksummedBytes, bool)>, PrefetchReadError<Client::ClientError>> {
+    ) -> Result<Option<CursorRead>, PrefetchReadError<Client::ClientError>> {
         let mut guard = self.inner.lock().await;
         let Some(inner) = guard.as_mut() else {
             return Ok(None);
@@ -155,6 +170,35 @@ where
     pub fn cursor_id(&self) -> CursorId {
         self.cursor_id
     }
+
+    /// This cursor's current read position, or `None` if it has been reset by the memory limiter.
+    /// Used by the prefetcher to compute per-cursor window bounds.
+    pub async fn current_offset(&self) -> Option<u64> {
+        let guard = self.inner.lock().await;
+        guard.as_ref().map(|inner| inner.current_offset)
+    }
+
+    /// This cursor's `(current_offset, window_upper_bound)`, or `None` if it has been reset by the
+    /// memory limiter. Test-only introspection used to assert that the prefetcher recomputes and
+    /// relaxes per-cursor window bounds as the tracked set changes.
+    #[cfg(test)]
+    pub async fn current_offset_and_bound(&self) -> Option<(u64, Option<u64>)> {
+        let guard = self.inner.lock().await;
+        guard
+            .as_ref()
+            .map(|inner| (inner.current_offset, inner.request_task.window_upper_bound()))
+    }
+
+    /// Limit (or clear, with `None`) how far this cursor's read window may grow, so it does not
+    /// fetch into the next tracked cursor's region. No-op if the cursor has been reset by the
+    /// memory limiter (its inner state is gone). Only limits future growth; never shrinks the
+    /// window below where it already reached.
+    pub async fn set_window_upper_bound(&self, bound: Option<u64>) {
+        let mut guard = self.inner.lock().await;
+        if let Some(inner) = guard.as_mut() {
+            inner.request_task.set_window_upper_bound(bound);
+        }
+    }
 }
 
 impl<Client> CursorInner<Client>
@@ -165,10 +209,14 @@ where
         &mut self,
         cursor: &Cursor<Client>,
         length: usize,
-    ) -> Result<(ChecksummedBytes, bool), PrefetchReadError<Client::ClientError>> {
+    ) -> Result<CursorRead, PrefetchReadError<Client::ClientError>> {
         let remaining = self.request_task.end_offset().saturating_sub(self.current_offset);
         if remaining == 0 {
-            return Ok((ChecksummedBytes::default(), false));
+            return Ok(CursorRead {
+                data: ChecksummedBytes::default(),
+                from_cache: false,
+                bound_reached: false,
+            });
         }
 
         let mut to_read = (length as u64).min(remaining);
@@ -179,6 +227,10 @@ where
 
             let part = self.request_task.read(to_read as usize).await?;
             all_parts_from_cache &= part.is_from_cache();
+            // Reading advanced the window; a read that has reached its bound signals the bound is
+            // stale. Sampled after each part (the flag is monotone across a read: the read position
+            // only advances within `do_read`).
+            let bound_reached = self.request_task.read_reached_window_bound();
             self.backward_seek_window.lock().unwrap().push(part.clone());
             let part_bytes = part.into_bytes(&cursor.object_id, self.current_offset)?;
 
@@ -187,7 +239,11 @@ where
             // into a new buffer. This should be the common case as long as part size is larger than
             // read size, which it almost always is for real S3 clients and FUSE.
             if response.is_empty() && part_bytes.len() == to_read as usize {
-                return Ok((part_bytes, all_parts_from_cache));
+                return Ok(CursorRead {
+                    data: part_bytes,
+                    from_cache: all_parts_from_cache,
+                    bound_reached,
+                });
             }
 
             let part_len = part_bytes.len() as u64;
@@ -202,7 +258,11 @@ where
             to_read -= part_len;
         }
 
-        Ok((response, all_parts_from_cache))
+        Ok(CursorRead {
+            data: response,
+            from_cache: all_parts_from_cache,
+            bound_reached: self.request_task.read_reached_window_bound(),
+        })
     }
 
     /// Whether the cursor can currently serve a read at `offset`. Mirrors the logic in

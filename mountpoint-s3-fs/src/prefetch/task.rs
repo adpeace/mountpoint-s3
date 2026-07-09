@@ -94,4 +94,23 @@ impl<Client: ObjectClient> RequestTask<Client> {
     pub fn read_window_end_offset(&self) -> u64 {
         self.backpressure_controller.read_window_end_offset()
     }
+
+    /// Limit (or clear, with `None`) how far this task's read window may grow. Used by the
+    /// prefetcher to keep a cursor's window from expanding into the next cursor's region.
+    pub fn set_window_upper_bound(&mut self, bound: Option<u64>) {
+        self.backpressure_controller.set_window_upper_bound(bound);
+    }
+
+    /// Whether the read position has reached (or passed) this task's window upper bound (a signal
+    /// that the bound has gone stale and per-cursor bounds should be recomputed). See
+    /// [BackpressureController::read_reached_window_bound].
+    pub fn read_reached_window_bound(&self) -> bool {
+        self.backpressure_controller.read_reached_window_bound()
+    }
+
+    /// The current upper bound on this task's read window, if any. Test-only introspection.
+    #[cfg(test)]
+    pub fn window_upper_bound(&self) -> Option<u64> {
+        self.backpressure_controller.window_upper_bound()
+    }
 }

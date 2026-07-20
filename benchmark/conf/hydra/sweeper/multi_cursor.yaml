@@ -1,0 +1,21 @@
+# @package hydra.sweeper
+# Sweep the multi-cursor A/B: feature off (max_cursors=1, pre-feature single-cursor behaviour) vs
+# on (max_cursors=8), across both interleaved read patterns. Explicit opt-in, NOT part of a default
+# run -- select with `hydra/sweeper=multi_cursor`. The default sweeper (`multi`) is unaffected.
+#
+# The single-value params below pin the multi_cursor_read job and enable the prefetch trace for
+# every combination, so selecting this sweeper alone runs the right workload with analyzable output
+# (without them the job would default to sequential_read and emit no cursor trace). It also pins
+# application_workers=1 and iteration=0: multi_cursor_read is a single-fd replay (extra app workers
+# are meaningless and would spawn concurrent mounts), giving a clean 2x2 = 4-combination A/B.
+defaults:
+  - base
+
+_target_: hydra_plugins.smart_sweeper.smart_benchmark_sweeper.SmartBenchmarkSweeper
+params:
+  'benchmarks.fio.fio_benchmark': multi_cursor_read
+  'mountpoint.prefetch_trace': 'true'
+  'application_workers': 1
+  'iteration': 0
+  'mountpoint.max_cursors': 1, 8
+  'benchmarks.fio.multi_cursor.pattern': multi_cursor, overlapping_cursors

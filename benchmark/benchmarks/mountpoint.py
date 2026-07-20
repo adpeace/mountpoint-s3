@@ -93,6 +93,9 @@ def mount_mp(cfg: DictConfig, mount_dir: str, with_flamegraph: bool = False) -> 
     if (fuse_threads := cfg.mountpoint.fuse_threads) is not None:
         subprocess_args.append(f"--max-threads={fuse_threads}")
 
+    if (max_cursors := cfg.mountpoint.max_cursors) is not None:
+        subprocess_args.append(f"--max-cursors={max_cursors}")
+
     for network_interface in cfg.network.interface_names:
         subprocess_args.append(f"--bind={network_interface}")
 
@@ -109,6 +112,15 @@ def mount_mp(cfg: DictConfig, mount_dir: str, with_flamegraph: bool = False) -> 
 
     if cfg.mountpoint.mountpoint_congestion_threshold is not None:
         mp_env["UNSTABLE_MOUNTPOINT_CONGESTION_THRESHOLD"] = str(cfg.mountpoint.mountpoint_congestion_threshold)
+
+    if cfg.mountpoint.prefetch_trace:
+        # Raise the --log-directory file layer to TRACE for the prefetcher only, so the log
+        # captures the cursor lifecycle lines (created new cursor / switched active cursor /
+        # received GetObject part) that tools/prefetch-visualizer and mc-remote-test/analyze.sh
+        # parse. MOUNTPOINT_LOG replaces the whole default filter on every layer, so the metrics
+        # target is re-added explicitly at info (matching --log-metrics, which this would otherwise
+        # silently defeat).
+        mp_env["MOUNTPOINT_LOG"] = "warn,mountpoint_s3_fs::prefetch=trace,mountpoint_s3_fs::metrics=info"
 
     mp_env["UNSTABLE_MOUNTPOINT_PID_FILE"] = f"{mount_dir}.pid"
     if not cfg.download_checksums:

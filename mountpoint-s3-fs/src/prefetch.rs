@@ -482,6 +482,15 @@ where
         self.cursors.len()
     }
 
+    /// The active (most-recently-used) cursor's id, or `None` if no cursor exists yet. Test-only
+    /// introspection: sampling this right after a read on a given stream reveals whether that
+    /// stream's cursor is the same one across reads (stable id) or has been evicted and recreated
+    /// (id changes to a strictly larger, never-reused value).
+    #[cfg(test)]
+    fn active_cursor_id(&self) -> Option<CursorId> {
+        self.cursors.last().map(|cursor| cursor.cursor_id())
+    }
+
     /// Per-cursor `(current_offset, window_upper_bound)` for every live cursor, in tracking order.
     /// Test-only introspection used to assert that per-cursor window bounds are recomputed — and
     /// relaxed — as cursors advance and the tracked set changes.
@@ -1910,6 +1919,60 @@ mod tests {
                 None,
                 "frontmost live cursor is unbounded"
             );
+        }
+
+        /// A dominant sequential stream sharing a file handle with up to `max_cursors - 1` concurrent
+        /// distant readers is undisturbed: its serving cursor keeps one stable id for the whole run.
+        /// Each dominant read refreshes its cursor to most-recently-used, so a burst of R distant
+        /// reads between two dominant reads (R competing cursors) evicts the dominant only once
+        /// `1 + R > max_cursors`; below that (`R <= max_cursors - 1`) it is always protected.
+        #[test]
+        fn dominant_stream_protected_below_cursor_cap() {
+            const MAX_CURSORS: usize = 8;
+            const OBJECT_SIZE: usize = 512 * MB;
+            const VISIT: usize = 128 * KB;
+            // The dominant stream is confined to the first half of the object; look-aside reads land
+            // at random VISIT-aligned offsets in the second half, spread widely enough that each
+            // lands where no existing cursor can serve it and creates a fresh competing cursor.
+            const DOMINANT_END: u64 = 256 * MB as u64;
+            const BURSTS: usize = 12;
+            // One fewer distant reader per burst than the cap, so the dominant is never evicted.
+            const DISTANT_PER_BURST: usize = MAX_CURSORS - 1;
+
+            block_on(async {
+                let (client, etag) = mock_client_with_object(OBJECT_SIZE);
+                let prefetcher = prefetcher_with_max_cursors(client.clone(), MAX_CURSORS);
+                let object_id = ObjectId::new("hello".to_owned(), etag);
+                let mut request = prefetcher.prefetch("test-bucket".to_owned(), object_id, OBJECT_SIZE as u64);
+
+                // Deterministic RNG for the random look-aside offsets in [DOMINANT_END, OBJECT_SIZE).
+                let distant_slots = (OBJECT_SIZE as u64 - DOMINANT_END) / VISIT as u64;
+                let mut rng = Pcg64::seed_from_u64(0x5eed);
+
+                let mut dominant_offset = 0u64;
+                // Prime the dominant cursor and record its id (the "created once" baseline).
+                read_and_check(&mut request, dominant_offset, VISIT).await;
+                dominant_offset += VISIT as u64;
+                let dominant_id = request.active_cursor_id().expect("dominant cursor must exist");
+
+                for _ in 0..BURSTS {
+                    // A burst of distant look-aside reads, with no dominant read between them, so they
+                    // create competing cursors after the dominant's last refresh.
+                    for _ in 0..DISTANT_PER_BURST {
+                        let offset = DOMINANT_END + rng.random_range(0..distant_slots) * VISIT as u64;
+                        read_and_check(&mut request, offset, VISIT).await;
+                    }
+                    // Return to the dominant stream: its serving cursor must be the same one throughout.
+                    read_and_check(&mut request, dominant_offset, VISIT).await;
+                    dominant_offset += VISIT as u64;
+                    assert_eq!(
+                        request.active_cursor_id().expect("dominant cursor must exist"),
+                        dominant_id,
+                        "dominant stream's cursor should stay stable with {DISTANT_PER_BURST} distant \
+                         readers (<= cap-1), but its id changed"
+                    );
+                }
+            });
         }
     }
 

@@ -1,0 +1,23 @@
+{
+  "run_label": "full",
+  "timestamp": "20260805T175535Z",
+  "git_commit": "4b3228b5a2f2e8f6f1f442d3fe9bc24ca1979b70",
+  "memory_target_mib": 2048,
+  "data_buffer_budget_mib": 1792,
+  "read_part_size": 8388608,
+  "write_part_size": 8388608,
+  "max_threads": 16,
+  "read_pool_count": 32,
+  "read_object_size_mib": 1024,
+  "readdir_dirs": 200,
+  "readdir_files_per_dir": 200,
+  "phase_secs": 600,
+  "seq_readers": 24,
+  "rand_readers": 32,
+  "writers": 16,
+  "slow_readers": 24,
+  "slow_read_rate": "1m",
+  "host": "ip-172-31-77-58.ec2.internal",
+  "nproc": 64,
+  "mount_cmd": "/home/ec2-user/memlimit-test/mountpoint-s3/target/release/mount-s3 adpeace-mountpoint-perf-test /home/ec2-user/memlimit-test/mountpoint-s3/memory-stress/runs/20260805T175535Z-full-2048MiB/mnt --prefix memlimit-test/ --memory-target 2048 --read-part-size 8388608 --write-part-size 8388608 --max-threads 16 --allow-overwrite --allow-delete --log-metrics --log-directory /home/ec2-user/memlimit-test/mountpoint-s3/memory-stress/runs/20260805T175535Z-full-2048MiB/mp_logs"
+}

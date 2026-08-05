@@ -1,0 +1,13 @@
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Build artifact (regenerate with `make`)
+*.pdf
+
+# Mount points and PID files created during runs (never commit)
+runs/*/mnt/
+runs/*/*.pid
+
+# Raw mountpoint logs can be large; keep metrics.csv + report artifacts instead
+runs/*/mp_logs/

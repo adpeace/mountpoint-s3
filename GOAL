@@ -1,0 +1,24 @@
+The memory limiter branch (checked out) tries to ensure that, under any workload, the memory usage of mountpoint-s3 stays under the limit specified on the command-line (or otherwise auto-detected).  Yuo will need to build this branch here or on the remote host (see below).  Use a subdirectory on the remote host as other work has happened there that I don't want to conflict with.
+
+I'd like us to test the limits of this by creating a test that runs for at least one hour, with a variety of workloads coming and going (sequential reads, slow reads, random reads, writes, readdir, etc., for exmaple) over the workload.  We should measure RSS as well and the reported metrics from mountpoint (pool.bytes_in_use and others).
+
+From this goal I want to:
+1. Define a test plan, measurement plan, and a report structure to report findings from teh test.
+2. Execute that plan on the host mpc7gn, which is reachable from this host over ssh.
+3. Report on findings.  Is the branch able to limit memory usage effectively?  If not, under what conditions does it fail?
+
+Save the report in markdown format with graphs alongside it/included in the appropriate places in the document.
+
+DO NOT push code.  DO NOT create PRs, CRs etc.  This is all LOCAL WORK ONLY.
+
+You need to be cogniszant there may be bugs that cause deadlocks or starvation - if you can identify them, that's great (stretch goal), but the testing should at least be resillient to this happening.
+
+The test should be reproducible, so if you give me a configuration that breaks then we can fix and re-run the exact test.
+
+The test should be against real mounts and use real filesystem operations: not a prefetcher benchmark or similar.  Oxplore the test setup available in benchmark/ and mountpoint-s3-fs/tests/fuse_tests/ to decide on the best approach.  The code you produce should be concise, easily reviewable by a human and of production quailty, so it can be checked into the repository later.
+
+The monitoring and report should include at least the memory limit used, a description of the workload (quantitative), and graphs for RSS and the mountpoint measured in-use memory.
+
+You can use a prefix under the bucket adpeace-mountpoint-perf-test, which the remote host has access to.
+
+Pencils down after five hours whether you completed or not.  Put enough time into preparation that you get a good result, I want to know where we are up to in five hours.  If I see potential, I may allow more time. 

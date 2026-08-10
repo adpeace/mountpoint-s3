@@ -1504,13 +1504,17 @@ mod tests {
                 }
                 let after_rounds = get_counter.count();
 
-                // The alternating rounds are served by the two existing cursors. The request count
-                // may grow modestly as each stream's read window advances, but must not grow by one
-                // request per visit (which would indicate a reset on every switch, i.e. today's
-                // single-cursor behaviour).
+                // The alternating rounds are served by the two existing cursors, not by resetting on
+                // every switch (which would cost one request per visit, i.e. 16). Each cursor issues
+                // exactly one more request here: priming opened each cursor's first request covering
+                // `initial_request_size` (1152 KiB) from its start offset, and the remainder of each
+                // cursor's stream is fetched by a second request that is deferred until the reader
+                // has consumed half of the first window. At 128 KiB per visit that threshold falls in
+                // the fifth visit to each stream, so both cursors open their second (and final)
+                // request during these rounds and neither needs another.
                 let extra_requests = after_rounds - after_priming;
-                assert!(
-                    extra_requests < 8,
+                assert_eq!(
+                    extra_requests, 2,
                     "expected cursors to be reused across alternation, but issued {extra_requests} \
                      extra requests over 16 visits (looks like reset-per-switch)"
                 );

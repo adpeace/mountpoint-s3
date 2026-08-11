@@ -28,6 +28,22 @@ struct Cli {
 
 #[tokio::main]
 async fn main() {
+    // Optional tracing, gated on `RUST_LOG` (e.g. `RUST_LOG=mountpoint_s3_fs::prefetch=trace`).
+    // Off by default so normal benchmark runs are quiet; when enabled the prefetch trace events
+    // can be fed to tools/prefetch-visualizer to inspect per-cursor window/read behaviour.
+    if let Ok(filter) = tracing_subscriber::EnvFilter::try_from_default_env() {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        let _ = tracing_subscriber::registry()
+            .with(filter)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(std::io::stderr),
+            )
+            .try_init();
+    }
+
     // Run the benchmark and handle errors
     if let Err(e) = run_benchmark().await {
         eprintln!("Error: {:?}", e);

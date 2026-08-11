@@ -118,6 +118,16 @@ where
         let _active_read_guard = inner
             .cursor_handle
             .set_active_read(inner.current_offset, initial_read_length);
+        // Emit the same frontier event as `try_read` for this cursor's very first read, so a
+        // visualizer sees the initial read (and window state) of every cursor, not just later ones.
+        trace!(
+            cursor_id = cursor.cursor_id.as_raw(),
+            offset,
+            length = initial_read_length,
+            available_offset = inner.request_task.available_offset(),
+            read_window_end_offset = inner.request_task.read_window_end_offset(),
+            "cursor serving read"
+        );
         let result = inner.do_read(&cursor, initial_read_length).await?;
         drop(guard);
 
@@ -146,6 +156,7 @@ where
             // Seek failed: this cursor cannot serve the read. The caller is responsible for
             // trying another cursor or creating a new one (and recording the reset metric).
             trace!(
+                cursor_id = self.cursor_id.as_raw(),
                 expected = inner.current_offset,
                 actual = offset,
                 "out-of-order read for this cursor"
@@ -153,6 +164,18 @@ where
             return Ok(None);
         }
 
+        // Emit the cursor's live frontier state so a log-based visualizer can plot, per cursor and
+        // over time: the read position (`offset`), how far data has been downloaded
+        // (`available_offset`), and the edge of the backpressure read window
+        // (`read_window_end_offset`).
+        trace!(
+            cursor_id = self.cursor_id.as_raw(),
+            offset,
+            length,
+            available_offset = inner.request_task.available_offset(),
+            read_window_end_offset = inner.request_task.read_window_end_offset(),
+            "cursor serving read"
+        );
         Ok(Some(inner.do_read(self, length).await?))
     }
 
@@ -302,19 +325,23 @@ where
             return Ok(true);
         }
 
-        trace!(from = self.current_offset, to = offset, "trying to seek");
+        trace!(
+            cursor_id = cursor.cursor_id.as_raw(),
+            from = self.current_offset,
+            to = offset,
+            "trying to seek"
+        );
         if offset > self.current_offset {
-            self.try_seek_forward(offset, cursor.max_forward_seek_wait_distance)
-                .await
+            self.try_seek_forward(offset, cursor).await
         } else {
-            self.try_seek_backward(offset).await
+            self.try_seek_backward(offset, cursor).await
         }
     }
 
     async fn try_seek_forward(
         &mut self,
         offset: u64,
-        max_forward_seek_wait_distance: u64,
+        cursor: &Cursor<Client>,
     ) -> Result<bool, PrefetchReadError<Client::ClientError>> {
         assert!(offset > self.current_offset);
         let total_seek_distance = offset - self.current_offset;
@@ -324,9 +351,10 @@ where
             return Ok(false);
         }
         let available_offset = self.request_task.available_offset();
-        let available_soon_offset = available_offset.saturating_add(max_forward_seek_wait_distance);
+        let available_soon_offset = available_offset.saturating_add(cursor.max_forward_seek_wait_distance);
         if offset >= available_soon_offset {
             trace!(
+                cursor_id = cursor.cursor_id.as_raw(),
                 requested_offset = offset,
                 available_offset = available_offset,
                 "seek failed: not enough data available"
@@ -344,7 +372,11 @@ where
         Ok(true)
     }
 
-    async fn try_seek_backward(&mut self, offset: u64) -> Result<bool, PrefetchReadError<Client::ClientError>> {
+    async fn try_seek_backward(
+        &mut self,
+        offset: u64,
+        cursor: &Cursor<Client>,
+    ) -> Result<bool, PrefetchReadError<Client::ClientError>> {
         assert!(offset < self.current_offset);
         let backwards_length_needed = self.current_offset - offset;
         histogram!("prefetch.seek_distance", "dir" => "backward").record(backwards_length_needed as f64);
@@ -355,7 +387,10 @@ where
             .unwrap()
             .read_back(backwards_length_needed as usize)
         else {
-            trace!("seek failed: not enough data in backwards seek window");
+            trace!(
+                cursor_id = cursor.cursor_id.as_raw(),
+                "seek failed: not enough data in backwards seek window"
+            );
             return Ok(false);
         };
         self.request_task.push_front(parts).await?;

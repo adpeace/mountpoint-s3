@@ -31,6 +31,9 @@
 //! is handed to the ObjectPartStream where the stream should call a provided function "before" fetching
 //! more data from the sources and put them into the part queue. The BackpressureLimiter should be used
 //! as a mean to block ObjectPartStream thread to fetch more data.
+//!
+//! Note: the trace events emitted by this file are parsed by the cursor visualisation tool in
+//! `tools/prefetch-visualizer`. Take care if changing their message or field content.
 
 use std::fmt::Debug;
 
@@ -348,6 +351,12 @@ where
             // make it the active (most-recently-used) cursor by moving it to the end.
             metrics::counter!(PREFETCH_CURSOR_SWITCHES).increment(1);
             let cursor = self.cursors.remove(index);
+            trace!(
+                cursor_id = cursor.cursor_id().as_raw(),
+                key = self.object_id.key(),
+                offset,
+                "switched active cursor"
+            );
             self.cursors.push(cursor);
             // See above: a read past its bound means the bound is stale, so recompute.
             if read.bound_reached {
@@ -360,6 +369,13 @@ where
         // request.
         let (cursor, read) = self.read_from_new_cursor(offset, length).await?;
         metrics::counter!(PREFETCH_CURSOR_CREATED).increment(1);
+        trace!(
+            cursor_id = cursor.cursor_id().as_raw(),
+            key = self.object_id.key(),
+            offset,
+            tracked_cursors = self.cursors.len() + 1,
+            "created new cursor"
+        );
         self.push_cursor(cursor);
         // The tracked set changed (a cursor was added, possibly one evicted), so recompute each
         // cursor's forward window bound to keep it from fetching into the next cursor's region.

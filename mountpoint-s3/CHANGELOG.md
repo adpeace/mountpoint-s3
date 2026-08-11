@@ -1,5 +1,7 @@
 ## Unreleased
 
+* Add the `--max-cursors N` argument to track multiple independent sequential read positions per file handle, improving throughput for applications that interleave several sequential streams through a single file handle (for example columnar or segmented file formats). Defaults to 1, which preserves the previous single-cursor behavior.
+
 ## v1.23.0 (July 20, 2026)
 
 * Add `--ca-bundle` flag (and `AWS_CA_BUNDLE` environment variable fallback) for trusting a custom certificate authority when Mountpoint makes HTTPS calls. ([#1834](https://github.com/awslabs/mountpoint-s3/pull/1834) by @yerzhan7)

@@ -321,6 +321,16 @@ At mount time, Mountpoint automatically selects appropriate defaults to provide 
 * By default, Mountpoint can serve up to 16 concurrent file or directory operations, and automatically scales up to reach this limit. If your application makes more than this many concurrent reads and writes (including to the same or different files), you can improve performance by increasing this limit with the `--max-threads` command-line argument. Higher values of this flag might cause Mountpoint to use more of your instance's resources.
 * When reading or writing files to S3, Mountpoint divides them into parts and uses parallel requests to improve throughput. You can change the part size Mountpoint uses for these parallel requests using the `--read-part-size` and `--write-part-size` command-line arguments, providing a maximum number of bytes per part for reading or writing respectively. For Mountpoint v1.7.2 or earlier, use `--part-size` instead. The default value for these arguments is 8 MiB (8,306,688 bytes), which in our testing is the largest value that achieves maximum throughput. Larger values can reduce the number of billed requests Mountpoint makes, but also reduce the throughput of object reads and writes to S3.
 
+### Interleaved sequential reads (multiple cursors)
+
+Mountpoint's prefetcher optimizes for sequential reads: as an application reads forward through a file, Mountpoint runs ahead and prefetches the data it expects to be read next. By default it tracks a single read position per file handle, so a read that lands far from that position is treated as a seek that resets prefetching. This is ideal when a file handle is used for one sequential stream.
+
+Some applications instead interleave several sequential streams through a single file handle — for example reading several regions of a large object in parallel, or a columnar or segmented file format that reads from different sections of one file. With a single read position, each switch between streams looks like a seek, so prefetching is repeatedly reset and throughput drops to that of random reads.
+
+The `--max-cursors N` command-line argument raises the number of independent sequential read positions ("cursors") Mountpoint tracks per file handle to `N` (default 1, maximum 64). Each interleaved stream is then matched to its own cursor and keeps prefetching independently. When more than `N` concurrent streams are active on one handle, the least-recently-used cursor is dropped to stay within the limit. The default of `--max-cursors 1` preserves the previous single-cursor behavior, so this feature has no effect unless you opt in with a value greater than 1.
+
+Enabling multiple cursors increases the maximum memory a single file handle can use for prefetching, because each cursor maintains its own prefetch window (see [Maximum prefetch window size](#maximum-prefetch-window-size)). Choose `N` to match the number of concurrent sequential streams your application drives through one file handle.
+
 ### Maximum number of files open for writing
 
 Mountpoint enforces a cap on the number of files that may be open for writing at the same time, to control memory usage. The cap is computed at startup from the configured memory target, the write part size, and one read part kept available for reads:
@@ -696,7 +706,7 @@ Configurations in this section are experimental and may be removed or superseded
 
 ### Maximum prefetch window size
 
-Mountpoint downloads object contents into memory ahead of read requests in order to optimize sequential-read throughput. The prefetch window size determines how much data Mountpoint would prefetch data into memory and the value can be different for each file handle. These window sizes are adjusted automatically based on available system memory, scaling up to a maximum of 2 GiB per file handle by default.
+Mountpoint downloads object contents into memory ahead of read requests in order to optimize sequential-read throughput. The prefetch window size determines how much data Mountpoint would prefetch data into memory and the value can be different for each file handle. These window sizes are adjusted automatically based on available system memory, scaling up to a maximum of 2 GiB per read cursor by default. With the default `--max-cursors 1` there is one cursor per file handle, so this is also the per-file-handle maximum; if you raise `--max-cursors` (see [Interleaved sequential reads (multiple cursors)](#interleaved-sequential-reads-multiple-cursors)), a file handle can maintain up to that many windows.
 
 This should work well for most use cases but if you need to use a different value, you can set the maximum prefetch window size to an arbitrary number with the `UNSTABLE_MOUNTPOINT_MAX_PREFETCH_WINDOW_SIZE` environment variable at mount time, providing a value in bytes.
 

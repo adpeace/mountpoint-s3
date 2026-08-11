@@ -132,6 +132,12 @@ impl TestSessionConfig {
         self.part_size = part_size;
         self
     }
+
+    /// Override the maximum number of prefetch cursors tracked per file handle.
+    pub fn with_max_cursors(mut self, max_cursors: usize) -> Self {
+        self.filesystem_config.prefetcher_config.max_cursors = max_cursors;
+        self
+    }
 }
 
 /// A mounted FUSE session that unmounts and joins its worker threads when dropped.

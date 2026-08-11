@@ -29,6 +29,9 @@ pub const FUSE_CACHE_HIT: &str = "fuse.cache_hit";
 pub const PROCESS_MEMORY_USAGE: &str = "process.memory_usage";
 
 pub const PREFETCH_RESET_STATE: &str = "prefetch.reset_state";
+pub const PREFETCH_CURSOR_SWITCHES: &str = "prefetch.cursor_switches";
+pub const PREFETCH_CURSOR_CREATED: &str = "prefetch.cursor_created";
+pub const PREFETCH_CURSOR_EVICTED: &str = "prefetch.cursor_evicted";
 
 pub const CACHE_GET_IO_SIZE: &str = "cache.get_io_size";
 pub const CACHE_PUT_IO_SIZE: &str = "cache.put_io_size";
@@ -101,6 +104,21 @@ pub fn lookup_config(name: &str) -> MetricConfig {
             otlp_attributes: &[],
         },
         PREFETCH_RESET_STATE => MetricConfig {
+            unit: Unit::Count,
+            stability: MetricStability::Experimental,
+            otlp_attributes: &[],
+        },
+        PREFETCH_CURSOR_SWITCHES => MetricConfig {
+            unit: Unit::Count,
+            stability: MetricStability::Experimental,
+            otlp_attributes: &[],
+        },
+        PREFETCH_CURSOR_CREATED => MetricConfig {
+            unit: Unit::Count,
+            stability: MetricStability::Experimental,
+            otlp_attributes: &[],
+        },
+        PREFETCH_CURSOR_EVICTED => MetricConfig {
             unit: Unit::Count,
             stability: MetricStability::Experimental,
             otlp_attributes: &[],

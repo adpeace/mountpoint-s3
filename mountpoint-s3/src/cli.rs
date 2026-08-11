@@ -214,6 +214,15 @@ Learn more in Mountpoint's configuration documentation (CONFIGURATION.md).\
 
     #[clap(
         long,
+        help = "Maximum number of concurrent sequential read cursors tracked per file handle; 1 disables multi-cursor tracking [default: 1]",
+        value_name = "N",
+        value_parser = value_parser!(u64).range(1..=64),
+        help_heading = ADVANCED_OPTIONS_HEADER,
+    )]
+    pub max_cursors: Option<u64>,
+
+    #[clap(
+        long,
         help = "Part size for multi-part PUT in bytes [default: 8388608]",
         value_name = "SIZE",
         value_parser = value_parser!(u64).range(1..usize::MAX as u64),
@@ -559,6 +568,9 @@ impl CliArgs {
         } else {
             ContentTypeDetection::Disabled
         };
+        if let Some(max_cursors) = self.max_cursors {
+            filesystem_config.prefetcher_config.max_cursors = max_cursors as usize;
+        }
         filesystem_config
     }
 

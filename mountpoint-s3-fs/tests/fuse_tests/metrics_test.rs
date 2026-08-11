@@ -13,7 +13,7 @@ use mountpoint_s3_fs::metrics::defs::{
 };
 
 use mountpoint_s3_fs::metrics::defs::{
-    ATTR_FUSE_REQUEST, FUSE_IO_SIZE, FUSE_REQUEST_ERRORS, FUSE_REQUEST_LATENCY, PREFETCH_RESET_STATE,
+    ATTR_FUSE_REQUEST, FUSE_IO_SIZE, FUSE_REQUEST_ERRORS, FUSE_REQUEST_LATENCY, PREFETCH_CURSOR_CREATED,
 };
 use rusty_fork::rusty_fork_test;
 use std::fs::File;
@@ -209,8 +209,8 @@ rusty_fork_test! {
             file.read_exact(&mut buffer).unwrap();
         }
 
-        let initial_reset_state = recorder
-            .get(PREFETCH_RESET_STATE, &[])
+        let initial_cursor_created = recorder
+            .get(PREFETCH_CURSOR_CREATED, &[])
             .map_or(0, |m| m.counter());
 
         // Jump around the file randomly to trigger out-of-order reads
@@ -221,13 +221,15 @@ rusty_fork_test! {
 
         drop(file);
 
-        let final_reset_state = recorder
-            .get(PREFETCH_RESET_STATE, &[])
+        let final_cursor_created = recorder
+            .get(PREFETCH_CURSOR_CREATED, &[])
             .map_or(0, |m| m.counter());
 
+        // With the default single-cursor cap, a distant out-of-order read cannot be served by the
+        // existing cursor, so a new cursor/request is created for it.
         assert!(
-            final_reset_state > initial_reset_state,
-            "Random access should increment reset_state metric"
+            final_cursor_created > initial_cursor_created,
+            "Random access should increment cursor_created metric"
         );
     }
 

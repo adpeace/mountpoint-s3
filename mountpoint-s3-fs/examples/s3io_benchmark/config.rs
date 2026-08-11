@@ -29,6 +29,10 @@ pub struct GlobalConfig {
     pub sse: Option<SseType>,
     pub sse_kms_key_id: Option<String>,
     pub checksum_algorithm: Option<ChecksumAlgorithm>,
+    /// Maximum number of prefetch cursors tracked per file handle. Default: 8 (the prefetcher
+    /// default). Set to 1 to compare against single-cursor behaviour. Applies to the whole run
+    /// (the prefetcher is shared across jobs), so compare values across separate config files/runs.
+    pub max_cursors: Option<usize>,
     /// Memory monitoring polling interval. Default: 100ms.
     #[serde(default, with = "humantime_serde")]
     pub memory_monitor_interval: Option<Duration>,

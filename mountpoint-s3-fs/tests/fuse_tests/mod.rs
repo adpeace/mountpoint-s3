@@ -9,6 +9,7 @@ mod lookup_test;
 mod manifest_test;
 mod metrics_test;
 mod mkdir_test;
+mod multi_cursor_test;
 mod prefetch_test;
 mod read_test;
 mod readdir_test;

@@ -42,6 +42,11 @@ impl SeekWindow {
         self.parts.push_back(part);
     }
 
+    /// Whether [`Self::read_back`] would succeed for the given length, without mutating the window.
+    pub fn can_read_back(&self, length: usize) -> bool {
+        length <= self.current_size
+    }
+
     /// Read off the back of the window. Returns None if there's not enough data in the window to
     /// satisfy the desired length.
     pub fn read_back(&mut self, mut length: usize) -> Option<Vec<Part>> {

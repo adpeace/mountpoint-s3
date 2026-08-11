@@ -110,7 +110,13 @@ impl Executor {
                 .default_checksum_algorithm(checksum_algorithm),
         );
 
-        let prefetcher = Prefetcher::default_builder(client.clone()).build(runtime, pool, PrefetcherConfig::default());
+        let prefetcher_config = PrefetcherConfig {
+            max_cursors: global
+                .max_cursors
+                .unwrap_or_else(|| PrefetcherConfig::default().max_cursors),
+            ..PrefetcherConfig::default()
+        };
+        let prefetcher = Prefetcher::default_builder(client.clone()).build(runtime, pool, prefetcher_config);
 
         Ok(Self {
             client,

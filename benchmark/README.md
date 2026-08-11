@@ -71,6 +71,46 @@ uv run benchmark.py benchmark_type=crt benchmarks.crt.crt_benchmarks_path=aws-cr
 
 ## Advanced configuration
 
+### Multi-cursor read benchmark
+
+The `multi_cursor_read` fio job measures Mountpoint's multi-cursor prefetching: several sequential
+read streams interleaved through a *single* file descriptor. Multi-cursor tracking only forms
+within one open file handle (one open maps to one prefetcher request), so the job replays a
+generated `read_iolog` on a single fd rather than opening the object multiple times.
+
+Run it by selecting the job and setting the mount's cursor cap:
+
+```sh
+uv run benchmark.py -- s3_bucket=amzn-s3-demo-bucket \
+    benchmarks.fio.fio_benchmark=multi_cursor_read \
+    mountpoint.max_cursors=8 \
+    mountpoint.prefetch_trace=true
+```
+
+`mountpoint.max_cursors` must be set explicitly (the job errors otherwise): it is the prefetcher's
+cursor cap and selects what you are measuring (`1` = the single-cursor behaviour the workload
+regresses to; `>1` = multi-cursor enabled). A clean A/B varies only `mountpoint.max_cursors` and
+keeps everything else fixed, so both arms replay the identical workload.
+
+The workload itself is configured under `benchmarks.fio.multi_cursor` (object key/size, the access
+`pattern`, and `num_cursors`). Two parameters are easy to confuse:
+
+- **`benchmarks.fio.multi_cursor.num_cursors`** is the *workload* shape: how many interleaved
+  sequential streams the application drives through the one fd. It is independent of the mount's
+  `max_cursors` and should stay fixed across an A/B.
+- **`mountpoint.max_cursors`** is how many of those streams the prefetcher will actually track
+  concurrently.
+
+Note that fio *jobs* are not read *cursors*. `application_workers` (fio `numjobs`) is fixed at 1
+for this job: it replays on a single fd to exercise one prefetcher's cursors. Setting more app
+workers would give N independent fds, each its own single-fd prefetcher with its own cursors --
+a different, "N parallel multi-cursor readers" measurement that this job does not currently model,
+so `application_workers > 1` has no effect here.
+
+With `mountpoint.prefetch_trace=true`, analyse a run with
+`analysis-scripts/analyze_multi_cursor.py` (reads the prefetch trace plus fio's JSON output) to
+report throughput, cursor counts, and read/over-fetch ratios.
+
 ### Configuring multiple network interfaces
 
 When investigating performance with multiple network cards,

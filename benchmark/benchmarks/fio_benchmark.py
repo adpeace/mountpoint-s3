@@ -1,5 +1,7 @@
 import logging
+import os
 import subprocess
+import sys
 import tempfile
 from datetime import datetime, timezone
 from typing import Any
@@ -50,14 +52,22 @@ class FioBenchmark(BaseBenchmark):
         fio_job_filepath = hydra.utils.to_absolute_path(f"fio/{fio_job_name}.fio")
         self.fio_output_filepath = f"fio.{fio_job_name}.json"
 
-        subprocess_args = [
+        common_args = [
             FIO_BINARY,
             "--eta=never",
             "--output-format=json",
             f"--output={self.fio_output_filepath}",
-            f"--directory={self.mount_dir}",
-            fio_job_filepath,
         ]
+
+        # The multi_cursor_read job replays a generated iolog through a single fd rather than
+        # laying out and reading whole files. It deliberately omits --directory: fio 3.32 segfaults
+        # replaying a version-2 iolog with a relative filename against --directory, so the file is
+        # located by an absolute replay_redirect target instead (see _multi_cursor_env).
+        if fio_job_name == "multi_cursor_read":
+            subprocess_args = [*common_args, fio_job_filepath]
+            return Command(args=subprocess_args, env=self._multi_cursor_env())
+
+        subprocess_args = [*common_args, f"--directory={self.mount_dir}", fio_job_filepath]
 
         fio_env = {}
         fio_env["APP_WORKERS"] = str(self.cfg.application_workers)
@@ -76,6 +86,56 @@ class FioBenchmark(BaseBenchmark):
         log.info("FIO command prepared with args: %s; env: %s", subprocess_args, fio_env)
 
         return Command(args=subprocess_args, env=fio_env)
+
+    def _multi_cursor_env(self) -> dict[str, str]:
+        """Generate the interleaved iolog for the multi_cursor_read job and return its fio env.
+
+        The read sequence reproduces run_interleaved_cursors from the s3io_benchmark example. The
+        number of interleaved streams is the *workload* parameter benchmarks.fio.multi_cursor.
+        num_cursors and is deliberately independent of the mount's --max-cursors: an A/B that varies
+        only mountpoint.max_cursors must replay the identical workload, so that the single-cursor
+        arm runs the same interleaved reads (served by one thrashing cursor) rather than a different,
+        sequential workload. The iolog is written into the Hydra job directory (cwd).
+        """
+        mc = self.cfg.benchmarks.fio.multi_cursor
+        num_cursors = mc.num_cursors
+
+        # The mount cap must be set explicitly: without it Mountpoint uses its built-in default,
+        # which would silently run the interleaved workload in some unintended cursor mode and
+        # invalidate the measurement. This is the workload's num_cursors' independent counterpart.
+        if self.cfg.mountpoint.max_cursors is None:
+            raise ValueError("multi_cursor_read requires mountpoint.max_cursors to be set explicitly")
+
+        iolog_path = os.path.abspath("multi_cursor.iolog")
+        generator = hydra.utils.to_absolute_path("fio/gen_interleaved_iolog.py")
+        gen_args = [
+            sys.executable,
+            generator,
+            f"--object-name={mc.object_key}",
+            f"--object-size={mc.object_size_bytes}",
+            f"--num-cursors={num_cursors}",
+            f"--visit={mc.visit}",
+            f"--read-size={mc.read_size}",
+            f"--pattern={mc.pattern}",
+            f"--output={iolog_path}",
+        ]
+        log.info("Generating multi-cursor iolog: %s", gen_args)
+        subprocess.run(gen_args, check=True)
+
+        # replay_redirect points every replayed read at the mounted file by absolute path. This
+        # avoids fio 3.32's segfault on relative-filename version-2 iolog replay under --directory
+        # and keeps the iolog itself mount-agnostic. DIRECT honours benchmarks.fio.direct_io (as the
+        # other jobs do) so the replayed offsets/sizes reach FUSE without kernel readahead reshaping
+        # them; without it the multi_cursor job would silently force buffered mode.
+        replay_target = os.path.join(self.mount_dir, mc.object_key)
+        return {
+            "IOLOG": iolog_path,
+            "REPLAY_TARGET": replay_target,
+            "DIRECT": "1" if self.cfg.benchmarks.fio.direct_io else "0",
+            # Wall-clock cap, same run_time knob the other jobs use. read_iolog does not loop, so
+            # this only bounds a slow (single-cursor) arm; a fast arm finishes early and stops.
+            "RUN_TIME": str(self.cfg.run_time),
+        }
 
     def post_process(self, result: CommandResult) -> dict[str, Any]:
         cleanup_mp(self.mount_dir)
